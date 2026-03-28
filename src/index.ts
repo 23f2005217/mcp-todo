@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker-provider.js";
+import { getAppSettings } from "./settings.js";
 import { registerTools } from "./tools.js";
 
 export default {
@@ -8,7 +9,13 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/" && request.method === "GET") {
-      return Response.json({ status: "ok", server: "mcp-todo", endpoint: "/mcp" });
+      const settings = await getAppSettings(env.APP_KV);
+      return Response.json({
+        status: "ok",
+        server: "mcp-todo",
+        endpoint: "/mcp",
+        settings,
+      });
     }
 
     if (url.pathname === "/mcp") {

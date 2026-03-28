@@ -19,6 +19,13 @@
 			"database_name": "mcp_todo_db",
 			"database_id": "9426b0c6-ff40-4ca9-94a1-2a5d115c507c"
 		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "APP_KV",
+			"id": "45420300b86b414db80b939ed9beb07e",
+			"preview_id": "a0f06d46e4a14db3b54d1062c4f98e83"
+		}
 	]
 	/**
 	 * Smart Placement

@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as db from "./db.js";
 import { PRIORITY_VALUES, PRIORITY_NAMES, type PriorityLevel } from "./db.js";
+import { getAppSettings, updateAppSettings } from "./settings.js";
 
 const prioritySchema = z.enum(["low", "medium", "high"]).describe("Priority level");
 const priorityArraySchema = z.array(z.enum(["low", "medium", "high"])).optional();
@@ -50,6 +51,29 @@ function err(msg: string) {
 }
 
 export function registerTools(server: McpServer, env: Env) {
+
+  // ── App Settings ──
+
+  server.tool(
+    "get_app_settings",
+    "Get KV-backed app settings used for default task behavior",
+    {},
+    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    async () => ok(await getAppSettings(env.APP_KV))
+  );
+
+  server.tool(
+    "update_app_settings",
+    "Update KV-backed app settings used for default task behavior",
+    {
+      default_quick_add_priority: prioritySchema.optional().describe("Default priority for quick_add_task"),
+      default_upcoming_days: z.number().int().min(1).max(365).optional().describe("Default day range for get_upcoming_tasks"),
+      default_focus_limit: z.number().int().min(1).max(25).optional().describe("Default item count for get_focus_tasks"),
+      default_plan_day_limit: z.number().int().min(1).max(100).optional().describe("Default item count for plan_day"),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => ok(await updateAppSettings(env.APP_KV, args))
+  );
 
   // ── Task CRUD ──
 
@@ -222,7 +246,8 @@ export function registerTools(server: McpServer, env: Env) {
     { days: z.number().optional().describe("Number of days (default 7)") },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async (args) => {
-      const tasks = await db.getUpcomingTasks(env.DB, args.days ?? 7);
+      const settings = await getAppSettings(env.APP_KV);
+      const tasks = await db.getUpcomingTasks(env.DB, args.days ?? settings.default_upcoming_days);
       const enriched = await db.enrichTasks(env.DB, tasks);
       return ok({ tasks: enriched.map(serializeEnrichedTask), count: enriched.length });
     }
@@ -234,7 +259,8 @@ export function registerTools(server: McpServer, env: Env) {
     { limit: z.number().optional().describe("Number of tasks (default 3)") },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async (args) => {
-      const tasks = await db.getFocusTasks(env.DB, args.limit ?? 3);
+      const settings = await getAppSettings(env.APP_KV);
+      const tasks = await db.getFocusTasks(env.DB, args.limit ?? settings.default_focus_limit);
       const enriched = await db.enrichTasks(env.DB, tasks);
       return ok({ tasks: enriched.map(serializeEnrichedTask), count: enriched.length });
     }
@@ -249,8 +275,9 @@ export function registerTools(server: McpServer, env: Env) {
     },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async (args) => {
+      const settings = await getAppSettings(env.APP_KV);
+      const limit = args.limit ?? settings.default_plan_day_limit;
       // Get tasks for the date, plus overdue tasks
-      const now = new Date().toISOString();
       const dateEnd = args.date + "T23:59:59Z";
       const dateStart = args.date + "T00:00:00Z";
 
@@ -258,7 +285,7 @@ export function registerTools(server: McpServer, env: Env) {
         completed: false,
         due_to: dateEnd,
         sort: "priority",
-        per_page: args.limit ?? 10,
+        per_page: limit,
       });
 
       // Also get overdue tasks (due before today)
@@ -270,7 +297,7 @@ export function registerTools(server: McpServer, env: Env) {
       // Deduplicate by id
       const seen = new Set<number>();
       const deduped = combined.filter(t => { if (seen.has(t.id)) return false; seen.add(t.id); return true; });
-      const limited = deduped.slice(0, args.limit ?? 10);
+      const limited = deduped.slice(0, limit);
       const enriched = await db.enrichTasks(env.DB, limited);
 
       return ok({
@@ -409,6 +436,7 @@ export function registerTools(server: McpServer, env: Env) {
     },
     { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
     async (args) => {
+      const settings = await getAppSettings(env.APP_KV);
       const slug = args.name
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
@@ -418,7 +446,7 @@ export function registerTools(server: McpServer, env: Env) {
       try {
         const task = await db.createTask(env.DB, {
           name: args.name, slug: uniqueSlug,
-          priority: toPriority(args.priority),
+          priority: toPriority(args.priority ?? settings.default_quick_add_priority),
           due_date: args.due_date,
         });
         const enriched = await db.enrichTask(env.DB, task);
