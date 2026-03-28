@@ -13,6 +13,9 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"ai": {
+		"binding": "AI"
+	},
 	"d1_databases": [
 		{
 			"binding": "DB",
@@ -25,6 +28,12 @@
 			"binding": "APP_KV",
 			"id": "45420300b86b414db80b939ed9beb07e",
 			"preview_id": "a0f06d46e4a14db3b54d1062c4f98e83"
+		}
+	],
+	"vectorize": [
+		{
+			"binding": "TASK_VECTORS",
+			"index_name": "mcp-todo-tasks"
 		}
 	]
 	/**

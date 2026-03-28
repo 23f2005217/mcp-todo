@@ -1,17 +1,17 @@
 export interface AppSettings {
   default_quick_add_priority: "low" | "medium" | "high";
+  default_capture_kind: "task" | "memory";
   default_upcoming_days: number;
-  default_focus_limit: number;
-  default_plan_day_limit: number;
+  default_snooze_hours: number;
 }
 
 const APP_SETTINGS_KEY = "app:settings";
 
 const DEFAULT_SETTINGS: AppSettings = {
   default_quick_add_priority: "medium",
+  default_capture_kind: "task",
   default_upcoming_days: 7,
-  default_focus_limit: 3,
-  default_plan_day_limit: 10,
+  default_snooze_hours: 24,
 };
 
 function clampInteger(value: unknown, min: number, max: number, fallback: number): number {
@@ -25,26 +25,27 @@ function normalizePriority(value: unknown): AppSettings["default_quick_add_prior
     : DEFAULT_SETTINGS.default_quick_add_priority;
 }
 
+function normalizeKind(value: unknown): AppSettings["default_capture_kind"] {
+  return value === "memory" || value === "task"
+    ? value
+    : DEFAULT_SETTINGS.default_capture_kind;
+}
+
 function normalizeSettings(value: Partial<AppSettings> | null | undefined): AppSettings {
   return {
     default_quick_add_priority: normalizePriority(value?.default_quick_add_priority),
+    default_capture_kind: normalizeKind(value?.default_capture_kind),
     default_upcoming_days: clampInteger(
       value?.default_upcoming_days,
       1,
       365,
       DEFAULT_SETTINGS.default_upcoming_days
     ),
-    default_focus_limit: clampInteger(
-      value?.default_focus_limit,
+    default_snooze_hours: clampInteger(
+      value?.default_snooze_hours,
       1,
-      25,
-      DEFAULT_SETTINGS.default_focus_limit
-    ),
-    default_plan_day_limit: clampInteger(
-      value?.default_plan_day_limit,
-      1,
-      100,
-      DEFAULT_SETTINGS.default_plan_day_limit
+      24 * 30,
+      DEFAULT_SETTINGS.default_snooze_hours
     ),
   };
 }
