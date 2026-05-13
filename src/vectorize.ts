@@ -22,13 +22,13 @@ function taskVectorId(taskId: number): string {
 }
 
 function buildEmbeddingText(
-  task: Pick<Task, "title" | "description" | "raw_input" | "item_kind"> & {
+  task: Pick<Task, "title" | "description" | "raw_input" | "item_kind" | "entity_type" | "lifecycle_state"> & {
     project?: { name: string } | null;
     group?: { name: string } | null;
     tags?: Array<{ name: string }>;
   }
 ): string {
-  const parts = [task.title.trim(), `kind: ${task.item_kind}`];
+  const parts = [task.title.trim(), `kind: ${task.item_kind}`, `entity: ${task.entity_type}`, `state: ${task.lifecycle_state}`];
   if (task.description?.trim()) {
     parts.push(task.description.trim());
   }
@@ -70,7 +70,7 @@ async function embedTexts(env: Env, texts: string[]): Promise<number[][]> {
 
 export async function upsertTaskVectors(
   env: Env,
-  tasks: Array<Pick<EnrichedTask, "id" | "title" | "description" | "raw_input" | "item_kind" | "project" | "group" | "tags">>
+  tasks: Array<Pick<EnrichedTask, "id" | "title" | "description" | "raw_input" | "item_kind" | "entity_type" | "lifecycle_state" | "objective_id" | "archived_at" | "project" | "group" | "tags">>
 ): Promise<VectorSyncResult | null> {
   if (tasks.length === 0) return null;
 
@@ -88,6 +88,12 @@ export async function upsertTaskVectors(
         values: embeddingBatch[index],
         metadata: {
           task_id: task.id,
+          entity_type: task.entity_type,
+          lifecycle_state: task.lifecycle_state,
+          project_slug: task.project?.slug ?? "",
+          objective_id: task.objective_id ?? 0,
+          is_recurring: task.entity_type === "recurring_system",
+          archived: Boolean(task.archived_at),
         },
       }))
     ) as VectorMutationResult;
@@ -133,13 +139,15 @@ function parseTaskId(vectorId: string): number | null {
 export async function semanticSearchTaskIds(
   env: Env,
   query: string,
-  limit: number
+  limit: number,
+  filter?: VectorizeVectorMetadataFilter
 ): Promise<VectorSearchMatch[]> {
   const embeddings = await embedTexts(env, [query]);
   const result = await env.TASK_VECTORS.query(embeddings[0], {
     namespace: TASK_NAMESPACE,
     topK: limit,
     returnValues: false,
+    filter,
   });
 
   return result.matches.flatMap((match) => {

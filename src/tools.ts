@@ -9,6 +9,14 @@ const ACTIVE_FOCUS_KEY = "focus:active";
 const ACTIVE_FOCUS_TTL_SECONDS = 120;
 
 const itemKindSchema = z.enum(["task", "memory"]);
+const entityTypeSchema = z.enum([
+  "strategic_goal",
+  "tactical_task",
+  "recurring_system",
+  "context_memory",
+  "archived_history",
+]);
+const lifecycleStateSchema = z.enum(["active", "superseded", "archived", "completed", "stale", "dormant"]);
 const recurrenceSchema = z.enum(["daily", "weekly", "monthly", "weekdays"]);
 const prioritySchema = z.enum(["low", "medium", "high"]);
 const sortSchema = z.enum([
@@ -25,19 +33,20 @@ const sortSchema = z.enum([
 ]);
 
 function ok(data: unknown) {
+  const structuredContent: Record<string, unknown> =
+    typeof data === "object" && data !== null && !Array.isArray(data)
+      ? data as Record<string, unknown>
+      : { result: data };
   return {
     content: [{ type: "text" as const, text: JSON.stringify(data) }],
-    structuredContent:
-      typeof data === "object" && data !== null && !Array.isArray(data)
-        ? data
-        : { result: data },
+    structuredContent,
   };
 }
 
 function err(message: string) {
   return {
     content: [{ type: "text" as const, text: message }],
-    isError: true,
+    isError: true as const,
   };
 }
 
@@ -52,6 +61,9 @@ function serializeTask(task: db.EnrichedTask) {
     description: task.description,
     raw_input: task.raw_input,
     item_kind: task.item_kind,
+    entity_type: task.entity_type,
+    lifecycle_state: task.lifecycle_state,
+    objective_id: task.objective_id,
     completed: task.completed === 1,
     priority: db.PRIORITY_NAMES[(task.priority as db.PriorityLevel) ?? 2] ?? "medium",
     priority_level: task.priority,
@@ -68,11 +80,29 @@ function serializeTask(task: db.EnrichedTask) {
     last_completed_at: task.last_completed_at,
     last_completed_due_at: task.last_completed_due_at,
     last_active_at: task.last_active_at,
+    stale_after_at: task.stale_after_at,
+    last_touched_at: task.last_touched_at,
+    last_meaningful_at: task.last_meaningful_at,
+    superseded_at: task.superseded_at,
     created_at: task.created_at,
     updated_at: task.updated_at,
     project: task.project,
     group: task.group,
     tags: task.tags,
+  };
+}
+
+function serializeFocusContext(context: db.FocusContext) {
+  return {
+    project: context.project,
+    objective: context.objective,
+    strategic_focus: context.strategic_focus ? serializeTask(context.strategic_focus) : null,
+    tactical_next_step: context.tactical_next_step ? serializeTask(context.tactical_next_step) : null,
+    blockers: context.blockers.map(serializeTask),
+    recurring_systems: context.recurring_systems.map(serializeTask),
+    replaced_items: context.replaced_items.map(serializeTask),
+    focus_version: context.focus_version,
+    generated_at: context.generated_at,
   };
 }
 
@@ -143,7 +173,14 @@ async function getCachedFocusTask(env: Env): Promise<db.EnrichedTask | null> {
   if (!cached?.task_id) return null;
 
   const task = await db.getTaskById(env.DB, cached.task_id);
-  if (!task || task.completed || task.item_kind !== "task" || task.archived_at) return null;
+  if (
+    !task ||
+    task.completed ||
+    task.item_kind !== "task" ||
+    task.entity_type !== "tactical_task" ||
+    task.lifecycle_state !== "active" ||
+    task.archived_at
+  ) return null;
 
   const now = new Date().toISOString();
   if (task.snoozed_until && task.snoozed_until > now) return null;
@@ -161,7 +198,13 @@ async function loadTask(env: Env, id: number) {
 }
 
 async function syncVectorForTask(env: Env, task: db.EnrichedTask) {
-  if (task.completed === 1 || task.archived_at) {
+  if (
+    task.completed === 1 ||
+    task.archived_at ||
+    task.lifecycle_state === "completed" ||
+    task.lifecycle_state === "archived" ||
+    task.lifecycle_state === "superseded"
+  ) {
     try {
       await deleteTaskVector(env, task.id);
     } catch {
@@ -213,6 +256,9 @@ export function registerTools(server: McpServer, env: Env) {
       description: z.string().optional(),
       raw_input: z.string().optional(),
       item_kind: itemKindSchema.default("task"),
+      entity_type: entityTypeSchema.optional(),
+      lifecycle_state: lifecycleStateSchema.optional(),
+      objective_id: z.number().int().positive().optional(),
       priority: prioritySchema.optional(),
       due: z.string().optional().describe("Human due date text or ISO timestamp"),
       project_slug: z.string().optional(),
@@ -235,6 +281,9 @@ export function registerTools(server: McpServer, env: Env) {
           description: args.description,
           raw_input: args.raw_input,
           item_kind: args.item_kind,
+          entity_type: args.entity_type,
+          lifecycle_state: args.lifecycle_state,
+          objective_id: args.objective_id ?? null,
           priority: toPriority(args.priority ?? settings.default_quick_add_priority),
           due_at: parsedDue.due_at,
           due_text: parsedDue.normalized,
@@ -352,6 +401,8 @@ export function registerTools(server: McpServer, env: Env) {
     {
       ids: z.array(z.number().int().positive()).optional(),
       kinds: z.array(itemKindSchema).optional(),
+      entity_types: z.array(entityTypeSchema).optional(),
+      lifecycle_states: z.array(lifecycleStateSchema).optional(),
       completed: z.boolean().optional(),
       archived: z.boolean().optional(),
       pinned: z.boolean().optional(),
@@ -373,6 +424,8 @@ export function registerTools(server: McpServer, env: Env) {
         const tasks = await db.listItems(env.DB, {
           ids: args.ids,
           kinds: args.kinds,
+          entity_types: args.entity_types,
+          lifecycle_states: args.lifecycle_states,
           completed: args.completed,
           archived: args.archived,
           pinned: args.pinned,
@@ -405,6 +458,10 @@ export function registerTools(server: McpServer, env: Env) {
       description: z.string().nullable().optional(),
       raw_input: z.string().nullable().optional(),
       item_kind: itemKindSchema.optional(),
+      entity_type: entityTypeSchema.optional(),
+      lifecycle_state: lifecycleStateSchema.optional(),
+      objective_id: z.number().int().positive().nullable().optional(),
+      clear_objective: z.boolean().optional(),
       priority: prioritySchema.optional(),
       due: z.string().optional(),
       clear_due: z.boolean().optional(),
@@ -431,6 +488,10 @@ export function registerTools(server: McpServer, env: Env) {
           description: args.description === null ? null : args.description,
           raw_input: args.raw_input === null ? null : args.raw_input,
           item_kind: args.item_kind,
+          entity_type: args.entity_type,
+          lifecycle_state: args.lifecycle_state,
+          objective_id: args.objective_id === undefined ? undefined : args.objective_id,
+          clear_objective: args.clear_objective || args.objective_id === null,
           priority: args.priority ? toPriority(args.priority) : undefined,
           due_at: args.due !== undefined ? parsedDue.due_at : undefined,
           due_text: args.due !== undefined ? parsedDue.normalized : undefined,
@@ -507,13 +568,25 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "get_focus_task",
-    "Return the single best task to focus next",
-    {},
+    "Return the active tactical next step from the current objective, kept for compatibility",
+    {
+      project_slug: z.string().optional(),
+    },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
-    async () => {
+    async (args) => {
       try {
-        const cached = await getCachedFocusTask(env);
+        const cached = args.project_slug ? null : await getCachedFocusTask(env);
         if (cached) return ok({ item: serializeTask(cached), source: "kv_cache" });
+
+        const context = await db.getFocusContext(env.DB, args.project_slug?.toLowerCase());
+        if (context.tactical_next_step) {
+          await setActiveFocus(env.APP_KV, context.tactical_next_step.id);
+          return ok({
+            item: serializeTask(context.tactical_next_step),
+            strategic_focus: context.strategic_focus ? serializeTask(context.strategic_focus) : null,
+            source: "focus_context",
+          });
+        }
 
         const task = await db.getFocusTask(env.DB);
         if (!task) return ok({ item: null });
@@ -523,6 +596,85 @@ export function registerTools(server: McpServer, env: Env) {
         return ok({ item: serializeTask(enriched), source: "d1" });
       } catch (error: unknown) {
         return err(`Failed to select focus task: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "get_focus_context",
+    "Return layered focus: strategic objective, active tactical next step, blockers, recurring systems, and replaced items",
+    {
+      project_slug: z.string().optional(),
+    },
+    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const context = await db.getFocusContext(env.DB, args.project_slug?.toLowerCase());
+        return ok(serializeFocusContext(context));
+      } catch (error: unknown) {
+        return err(`Failed to get focus context: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "set_active_objective",
+    "Set the one canonical active strategic objective for a project, creating it when title is supplied",
+    {
+      project_slug: z.string().min(1),
+      item_id: z.number().int().positive().optional(),
+      title: z.string().min(1).optional(),
+      description: z.string().optional(),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const result = await db.setActiveObjective(env.DB, {
+          project_slug: args.project_slug.toLowerCase(),
+          item_id: args.item_id,
+          title: args.title,
+          description: args.description,
+        });
+        await clearActiveFocus(env.APP_KV);
+        await syncVectorForTask(env, result.item);
+        return ok({
+          project: result.project,
+          objective: result.objective,
+          item: serializeTask(result.item),
+        });
+      } catch (error: unknown) {
+        return err(`Failed to set active objective: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "supersede_items",
+    "Mark old items as superseded by a newer item and add supersedes relationships",
+    {
+      source_item_id: z.number().int().positive(),
+      target_item_ids: z.array(z.number().int().positive()).min(1),
+      reason: z.string().optional(),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const result = await db.supersedeItems(env.DB, args.source_item_id, args.target_item_ids, args.reason);
+        await clearActiveFocus(env.APP_KV);
+        for (const item of result.superseded) {
+          try {
+            await deleteTaskVector(env, item.id);
+          } catch {
+            // D1 remains source of truth.
+          }
+        }
+        await syncVectorForTask(env, result.source);
+        return ok({
+          source: serializeTask(result.source),
+          superseded: result.superseded.map(serializeTask),
+        });
+      } catch (error: unknown) {
+        return err(`Failed to supersede items: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );
@@ -541,6 +693,27 @@ export function registerTools(server: McpServer, env: Env) {
         return ok({ items: enriched.map(serializeTask), count: enriched.length });
       } catch (error: unknown) {
         return err(`Failed to get stale tasks: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "mark_stale_candidates",
+    "Mark untouched active tactical tasks as stale so they stop competing for focus",
+    {
+      limit: z.number().int().min(1).max(100).optional(),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const items = await db.markStaleCandidates(env.DB, args.limit ?? 25);
+        await clearActiveFocus(env.APP_KV);
+        for (const item of items) {
+          await syncVectorForTask(env, item);
+        }
+        return ok({ items: items.map(serializeTask), count: items.length });
+      } catch (error: unknown) {
+        return err(`Failed to mark stale candidates: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );
@@ -580,11 +753,32 @@ export function registerTools(server: McpServer, env: Env) {
     {
       query: z.string().min(1),
       kinds: z.array(itemKindSchema).optional(),
+      entity_types: z.array(entityTypeSchema).optional(),
+      lifecycle_states: z.array(lifecycleStateSchema).optional(),
+      include_obsolete: z.boolean().optional(),
+      limit: z.number().int().min(1).max(50).optional(),
     },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async (args) => {
       try {
-        const matches = await semanticSearchTaskIds(env, args.query, 5);
+        const defaultStates = args.include_obsolete
+          ? undefined
+          : args.lifecycle_states ?? ["active", "dormant"];
+        const filter = args.include_obsolete
+          ? undefined
+          : {
+              lifecycle_state: { $in: defaultStates },
+              entity_type: {
+                $in: args.entity_types ?? ["strategic_goal", "tactical_task", "context_memory"],
+              },
+              archived: false,
+            };
+        let matches;
+        try {
+          matches = await semanticSearchTaskIds(env, args.query, args.limit ?? 10, filter);
+        } catch {
+          matches = await semanticSearchTaskIds(env, args.query, args.limit ?? 10);
+        }
         const hydrated = await db.enrichTasks(
           env.DB,
           await db.getTasksByIds(env.DB, matches.map((match) => match.taskId))
@@ -594,11 +788,78 @@ export function registerTools(server: McpServer, env: Env) {
           const task = byId.get(match.taskId);
           if (!task) return [];
           if (args.kinds && !args.kinds.includes(task.item_kind)) return [];
+          if (args.entity_types && !args.entity_types.includes(task.entity_type)) return [];
+          if (defaultStates && !defaultStates.includes(task.lifecycle_state)) return [];
+          if (!args.include_obsolete && (task.archived_at || task.completed === 1 || task.lifecycle_state === "superseded")) return [];
           return [{ score: match.score, item: serializeTask(task) }];
         });
         return ok({ query: args.query, matches: filtered, count: filtered.length });
       } catch (error: unknown) {
         return err(`Failed to semantic-search items: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "find_semantic_conflicts",
+    "Find active items semantically similar to a query or item and return likely duplicate/supersession candidates",
+    {
+      query: z.string().optional(),
+      item_id: z.number().int().positive().optional(),
+      project_slug: z.string().optional(),
+      threshold: z.number().min(0).max(1).default(0.78),
+      limit: z.number().int().min(1).max(50).optional(),
+    },
+    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        let query = args.query;
+        if (!query && args.item_id) {
+          const item = await loadTask(env, args.item_id);
+          if (!item) return err(`Item '${args.item_id}' not found`);
+          query = [item.title, item.description, item.raw_input].filter(Boolean).join("\n");
+        }
+        if (!query) return err("Provide query or item_id");
+
+        const matches = await semanticSearchTaskIds(env, query, args.limit ?? 10);
+        const hydrated = await db.enrichTasks(env.DB, await db.getTasksByIds(env.DB, matches.map((match) => match.taskId)));
+        const byId = new Map(hydrated.map((task) => [task.id, task]));
+        const conflicts = matches.flatMap((match) => {
+          const item = byId.get(match.taskId);
+          if (!item) return [];
+          if (args.item_id && item.id === args.item_id) return [];
+          if (match.score < args.threshold) return [];
+          if (args.project_slug && item.project?.slug !== args.project_slug.toLowerCase()) return [];
+          if (item.lifecycle_state !== "active" || item.archived_at || item.completed === 1) return [];
+          return [{
+            score: match.score,
+            suggested_action: item.updated_at < new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString() ? "supersede_or_merge" : "merge_or_link",
+            item: serializeTask(item),
+          }];
+        });
+        return ok({ query, conflicts, count: conflicts.length });
+      } catch (error: unknown) {
+        return err(`Failed to find semantic conflicts: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "get_project_timeline",
+    "Return objective/focus/history events for a project",
+    {
+      project_slug: z.string().min(1),
+      limit: z.number().int().min(1).max(100).optional(),
+    },
+    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        return ok({
+          project_slug: args.project_slug.toLowerCase(),
+          timeline: await db.getProjectTimeline(env.DB, args.project_slug.toLowerCase(), args.limit ?? 50),
+        });
+      } catch (error: unknown) {
+        return err(`Failed to get project timeline: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );
