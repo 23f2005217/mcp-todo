@@ -283,6 +283,8 @@ describe("get_startup_context tool", () => {
     const result = await invokeTool(tools, "get_startup_context", {});
     const data = resultData(result) as Record<string, unknown>;
     assert.strictEqual(data.source, "d1");
+    assert.strictEqual(data.mode, "normal");
+    assert.ok(data.current_focus && typeof data.current_focus === "object");
     assert.ok(Array.isArray(data.always_load));
     assert.ok(Array.isArray(data.profile_context));
     assert.ok(Array.isArray(data.active_objectives));
@@ -353,5 +355,133 @@ describe("get_startup_context tool", () => {
     const data = resultData(result) as Record<string, unknown>;
     assert.strictEqual(data.source, "d1");
     // With use_cache=false the existing cached value is left untouched; only behavior verified above.
+  });
+
+  it("minimal mode omits objectives, summaries, and history by default", async () => {
+    const { server, tools } = createMockServer();
+    const { db, queries } = createMockDb();
+    const { kv } = createMockKv();
+    registerTools(server, { DB: db, APP_KV: kv } as Env);
+
+    const result = await invokeTool(tools, "get_startup_context", { mode: "minimal", topics: ["Work"] });
+    const data = resultData(result) as Record<string, unknown>;
+    assert.strictEqual(data.mode, "minimal");
+    assert.ok(data.current_focus && typeof data.current_focus === "object");
+    assert.deepStrictEqual(data.active_objectives, []);
+    assert.deepStrictEqual(data.recent_summaries, []);
+    assert.deepStrictEqual(data.historical_background, []);
+    assert.ok(Array.isArray(data.always_load));
+    assert.ok(Array.isArray(data.profile_context));
+    assert.ok(Array.isArray(data.active_projects));
+    assert.ok(Array.isArray(data.pinned_context));
+
+    const objectiveQuery = queries.find(
+      (q) => q.sql.includes("entity_type IN (?)") && q.params.includes("strategic_goal")
+    );
+    assert.ok(!objectiveQuery);
+  });
+});
+
+describe("find_consolidation_candidates tool", () => {
+  it("is registered as read-only", () => {
+    const { server, tools } = createMockServer();
+    const { db } = createMockDb();
+    const { kv } = createMockKv();
+    registerTools(server, { DB: db, APP_KV: kv } as Env);
+    const tool = tools.get("find_consolidation_candidates");
+    assert.ok(tool);
+    assert.strictEqual(tool.options.readOnlyHint, true);
+    assert.strictEqual(tool.options.destructiveHint, false);
+  });
+
+  it("returns candidate groups based on shared tags", async () => {
+    const { server, tools } = createMockServer();
+    const { db, queries } = createMockDb([
+      { id: 1, title: "A", lifecycle_state: "active", updated_at: "2026-01-01T00:00:00Z", tag_name: "idea", tag_slug: "idea" },
+      { id: 2, title: "B", lifecycle_state: "active", updated_at: "2026-01-02T00:00:00Z", tag_name: "idea", tag_slug: "idea" },
+    ]);
+    const { kv } = createMockKv();
+    registerTools(server, { DB: db, APP_KV: kv } as Env);
+
+    const result = await invokeTool(tools, "find_consolidation_candidates", {});
+    const data = resultData(result) as Record<string, unknown>;
+    const candidates = data.candidates as Array<Record<string, unknown>>;
+    assert.strictEqual(candidates.length, 1);
+    assert.strictEqual(candidates[0].group_key, "idea");
+    assert.deepStrictEqual(candidates[0].shared_tags, ["idea"]);
+    assert.ok(Array.isArray(candidates[0].items));
+    assert.strictEqual((candidates[0].items as Array<Record<string, unknown>>).length, 2);
+
+    const candidateQuery = queries.find((q) => q.sql.includes("FROM todos t") && q.sql.includes("JOIN task_tags"));
+    assert.ok(candidateQuery);
+    assert.ok(candidateQuery.params.includes("memory"));
+  });
+});
+
+describe("consolidate_memories tool", () => {
+  it("is registered as destructive", () => {
+    const { server, tools } = createMockServer();
+    const { db } = createMockDb();
+    const { kv } = createMockKv();
+    registerTools(server, { DB: db, APP_KV: kv } as Env);
+    const tool = tools.get("consolidate_memories");
+    assert.ok(tool);
+    assert.strictEqual(tool.options.readOnlyHint, false);
+    assert.strictEqual(tool.options.destructiveHint, true);
+  });
+
+  it("creates relationships and marks targets superseded", async () => {
+    const { server, tools } = createMockServer();
+    const { db, queries } = createMockDb([
+      {
+        id: 1,
+        title: "Keeper",
+        description: null,
+        raw_input: null,
+        item_kind: "memory",
+        entity_type: "context_memory",
+        lifecycle_state: "active",
+        completed: 0,
+        pinned: 0,
+        project_id: null,
+        group_id: null,
+        objective_id: null,
+        due_date: null,
+        due_text: null,
+        recurrence_kind: null,
+        recurrence_interval: null,
+        recurrence_until: null,
+        archived_at: null,
+        superseded_at: null,
+        ignored_at: null,
+        snoozed_until: null,
+        last_active_at: null,
+        last_touched_at: null,
+        startup_priority: 5,
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      },
+    ]);
+    const { kv } = createMockKv();
+    registerTools(server, { DB: db, APP_KV: kv } as Env);
+
+    const result = await invokeTool(tools, "consolidate_memories", {
+      source_item_id: 1,
+      target_item_ids: [2, 3],
+      relationship_type: "supersedes",
+      reason: "Consolidating duplicates",
+    });
+    const data = resultData(result) as Record<string, unknown>;
+    assert.strictEqual(data.created_relationships, 2);
+
+    const relationshipQuery = queries.find(
+      (q) => q.sql.includes("INSERT OR IGNORE INTO item_relationships") && q.params.includes("supersedes")
+    );
+    assert.ok(relationshipQuery);
+
+    const supersedeUpdate = queries.find(
+      (q) => q.sql.includes("UPDATE todos") && q.sql.includes("lifecycle_state = 'superseded'")
+    );
+    assert.ok(supersedeUpdate);
   });
 });

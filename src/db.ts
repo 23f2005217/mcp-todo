@@ -1392,6 +1392,162 @@ export async function logEvent(
     .run();
 }
 
+export interface ConsolidationCandidate {
+  group_key: string;
+  shared_tags: string[];
+  suggested_relationship: Extract<RelationshipType, "duplicate_of" | "supersedes" | "replaces" | "derived_from">;
+  items: Array<Pick<Task, "id" | "title" | "lifecycle_state" | "updated_at">>;
+  reason: string;
+}
+
+export async function findConsolidationCandidates(
+  db: D1Database,
+  options: {
+    item_kind?: ItemKind;
+    tag_slug?: string;
+    min_group_size?: number;
+    limit?: number;
+  } = {}
+): Promise<ConsolidationCandidate[]> {
+  const itemKind = options.item_kind ?? "memory";
+  const minGroupSize = Math.max(2, options.min_group_size ?? 2);
+  const limit = options.limit ?? 20;
+
+  const tagFilter = options.tag_slug?.toLowerCase();
+
+  const rows = await db
+    .prepare(
+      `SELECT t.id, t.title, t.lifecycle_state, t.updated_at, tag.name AS tag_name, tag.slug AS tag_slug
+       FROM todos t
+       JOIN task_tags tt ON tt.task_id = t.id
+       JOIN tags tag ON tag.id = tt.tag_id
+       WHERE t.item_kind = ?
+         AND t.archived_at IS NULL
+         AND t.completed = 0
+         AND t.lifecycle_state IN ('active', 'dormant')
+         ${tagFilter ? "AND tag.slug = ?" : ""}
+       ORDER BY tag.slug ASC, t.updated_at DESC`
+    )
+    .bind(itemKind, ...(tagFilter ? [tagFilter] : []))
+    .all()
+    .then((result) => result.results as Array<Record<string, unknown> & { tag_slug: string; tag_name: string }>);
+
+  const byTag = new Map<string, Map<number, ConsolidationCandidate["items"][number] & { tag_names: Set<string> }>>();
+  for (const row of rows) {
+    const item = {
+      id: Number(row.id),
+      title: String(row.title),
+      lifecycle_state: String(row.lifecycle_state) as LifecycleState,
+      updated_at: String(row.updated_at),
+      tag_names: new Set<string>(),
+    };
+    const tagSlug = String(row.tag_slug);
+    const tagName = String(row.tag_name);
+    const group = byTag.get(tagSlug) ?? new Map();
+    const existing = group.get(item.id);
+    if (existing) {
+      existing.tag_names.add(tagName);
+    } else {
+      item.tag_names.add(tagName);
+      group.set(item.id, item);
+    }
+    byTag.set(tagSlug, group);
+  }
+
+  const candidates: ConsolidationCandidate[] = [];
+  for (const [tagSlug, group] of byTag) {
+    if (group.size < minGroupSize) continue;
+    const items = Array.from(group.values())
+      .map(({ tag_names, ...item }) => item)
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    const newest = items[0];
+    const oldest = items[items.length - 1];
+    const sharedTag = rows.find((r) => String(r.tag_slug) === tagSlug)?.tag_name ?? tagSlug;
+
+    let suggestedRelationship: ConsolidationCandidate["suggested_relationship"] = "supersedes";
+    let reason = `Items share tag '${sharedTag}'; newest (id ${newest.id}) likely supersedes older ones.`;
+
+    if (items.every((item) => item.title === newest.title)) {
+      suggestedRelationship = "duplicate_of";
+      reason = `Items share tag '${sharedTag}' and identical titles; likely duplicates.`;
+    } else if (newest.lifecycle_state === "active" && oldest.lifecycle_state === "dormant") {
+      suggestedRelationship = "replaces";
+      reason = `Active item (id ${newest.id}) replaces dormant items sharing tag '${sharedTag}'.`;
+    }
+
+    candidates.push({
+      group_key: tagSlug,
+      shared_tags: [sharedTag],
+      suggested_relationship: suggestedRelationship,
+      items,
+      reason,
+    });
+  }
+
+  return candidates
+    .sort((a, b) => b.items.length - a.items.length)
+    .slice(0, limit);
+}
+
+export async function consolidateItems(
+  db: D1Database,
+  sourceItemId: number,
+  targetItemIds: number[],
+  relationshipType: Extract<RelationshipType, "duplicate_of" | "supersedes" | "replaces" | "derived_from">,
+  reason?: string | null,
+  markSuperseded = true
+): Promise<{ source: EnrichedTask; targets: EnrichedTask[]; created_relationships: number }> {
+  const source = await getTaskById(db, sourceItemId);
+  if (!source) throw new Error(`Source item '${sourceItemId}' not found`);
+
+  const now = new Date().toISOString();
+  let created = 0;
+  const targets: Task[] = [];
+
+  for (const targetId of Array.from(new Set(targetItemIds))) {
+    if (targetId === sourceItemId) continue;
+    const target = await getTaskById(db, targetId);
+    if (!target) continue;
+
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO item_relationships
+         (source_item_id, target_item_id, relationship_type, confidence, metadata)
+         VALUES (?, ?, ?, 1.0, ?)`
+      )
+      .bind(sourceItemId, targetId, relationshipType, JSON.stringify({ reason: reason ?? null }))
+      .run();
+    created++;
+
+    if (markSuperseded) {
+      await db
+        .prepare(
+          `UPDATE todos
+           SET lifecycle_state = 'superseded',
+               superseded_at = COALESCE(superseded_at, ?),
+               updated_at = ?,
+               last_touched_at = ?
+           WHERE id = ?`
+        )
+        .bind(now, now, now, targetId)
+        .run();
+    }
+
+    const updated = await getTaskById(db, targetId);
+    if (updated) targets.push(updated);
+    await logEvent(db, targetId, target.project_id, "consolidated", {
+      by: sourceItemId,
+      relationship_type: relationshipType,
+      reason: reason ?? null,
+    });
+  }
+
+  if (source.project_id) await touchProjectFocus(db, source.project_id);
+  const refreshedSource = await getTaskById(db, sourceItemId);
+  if (!refreshedSource) throw new Error(`Source item '${sourceItemId}' disappeared`);
+  return { source: await enrichTask(db, refreshedSource), targets: await enrichTasks(db, targets), created_relationships: created };
+}
+
 // Context retrieval helpers are implemented in ./context.ts
 export {
   ContextLoadQuery,

@@ -145,6 +145,54 @@ function serializeFocusContext(context: db.FocusContext) {
   };
 }
 
+interface SectionDefaults {
+  always_load: boolean;
+  profile: boolean;
+  focus: boolean;
+  objectives: boolean;
+  projects: boolean;
+  pinned: boolean;
+  summaries: boolean;
+  history: boolean;
+}
+
+function modeDefaults(mode: "minimal" | "normal" | "full"): SectionDefaults {
+  if (mode === "minimal") {
+    return {
+      always_load: true,
+      profile: true,
+      focus: true,
+      objectives: false,
+      projects: true,
+      pinned: true,
+      summaries: false,
+      history: false,
+    };
+  }
+  if (mode === "full") {
+    return {
+      always_load: true,
+      profile: true,
+      focus: true,
+      objectives: true,
+      projects: true,
+      pinned: true,
+      summaries: true,
+      history: true,
+    };
+  }
+  return {
+    always_load: true,
+    profile: true,
+    focus: true,
+    objectives: true,
+    projects: true,
+    pinned: true,
+    summaries: true,
+    history: false,
+  };
+}
+
 function normalizeTags(tags?: string[]) {
   return Array.from(new Set(tags?.map((tag) => tag.trim().toLowerCase()).filter(Boolean) ?? []));
 }
@@ -252,7 +300,11 @@ async function syncVectorForTask(env: Env, task: db.EnrichedTask) {
     return;
   }
 
-  await upsertTaskVectors(env, [task]);
+  try {
+    await upsertTaskVectors(env, [task]);
+  } catch {
+    // D1 remains source of truth if vector sync fails.
+  }
 }
 
 export function registerTools(server: McpServer, env: Env) {
@@ -951,6 +1003,69 @@ export function registerTools(server: McpServer, env: Env) {
   );
 
   server.tool(
+    "find_consolidation_candidates",
+    "Deterministically find groups of context items (especially memories) that share tags and may be duplicates, supersessions, or replacements",
+    {
+      item_kind: z.enum(["memory", "task"]).optional().default("memory"),
+      tag: z.string().optional(),
+      min_group_size: z.number().int().min(2).optional(),
+      limit: z.number().int().min(1).max(50).optional(),
+    },
+    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const candidates = await db.findConsolidationCandidates(env.DB, {
+          item_kind: args.item_kind,
+          tag_slug: args.tag,
+          min_group_size: args.min_group_size,
+          limit: args.limit,
+        });
+        return ok({ candidates, count: candidates.length });
+      } catch (error: unknown) {
+        return err(`Failed to find consolidation candidates: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "consolidate_memories",
+    "Link a keeper item to related items with a relationship and optionally mark the targets as superseded",
+    {
+      source_item_id: z.number().int().positive(),
+      target_item_ids: z.array(z.number().int().positive()).min(1),
+      relationship_type: z.enum(["duplicate_of", "supersedes", "replaces", "derived_from"]),
+      reason: z.string().optional(),
+      mark_superseded: z.boolean().optional().default(true),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    async (args) => {
+      try {
+        const result = await db.consolidateItems(
+          env.DB,
+          args.source_item_id,
+          args.target_item_ids,
+          args.relationship_type,
+          args.reason,
+          args.mark_superseded
+        );
+        await clearActiveFocus(env.APP_KV);
+        await syncVectorForTask(env, result.source);
+        for (const target of result.targets) {
+          await syncVectorForTask(env, target);
+        }
+        await invalidateContextCache(env.APP_KV);
+        return ok({
+          source: serializeTask(result.source),
+          targets: result.targets.map(serializeTask),
+          created_relationships: result.created_relationships,
+        });
+      } catch (error: unknown) {
+        return err(`Failed to consolidate memories: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
     "get_project_timeline",
     "Return objective/focus/history events for a project",
     {
@@ -1097,15 +1212,24 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "get_startup_context",
-    "Return a bundled conversation startup loadout: always-load items, profile context, active objectives, active projects, pinned context, recent summaries, and optional historical background",
+    "Return a bundled conversation startup loadout: always-load items, profile context, current focus, active objectives, active projects, pinned context, recent summaries, and optional historical background",
     {
       topics: z.array(z.string()).optional().describe("Topic/project slugs to include in recent summaries"),
-      include_history: z.boolean().optional().default(false).describe("Include priority-3 historical/background items"),
+      mode: z.enum(["minimal", "normal", "full"]).optional().default("normal").describe("Amount of context to load"),
+      include_always_load: z.boolean().optional().describe("Override mode default for always_load section"),
+      include_profile: z.boolean().optional().describe("Override mode default for profile_context section"),
+      include_focus: z.boolean().optional().describe("Override mode default for current_focus section"),
+      include_objectives: z.boolean().optional().describe("Override mode default for active_objectives section"),
+      include_projects: z.boolean().optional().describe("Override mode default for active_projects section"),
+      include_pinned: z.boolean().optional().describe("Override mode default for pinned_context section"),
+      include_summaries: z.boolean().optional().describe("Override mode default for recent_summaries section"),
+      include_history: z.boolean().optional().describe("Override mode default for historical_background section"),
       use_cache: z.boolean().optional().default(true),
     },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async (args) => {
       try {
+        const mode = args.mode ?? "normal";
         const useCache = args.use_cache ?? true;
         if (useCache) {
           const cached = await getCachedStartupContext(env.APP_KV);
@@ -1114,14 +1238,36 @@ export function registerTools(server: McpServer, env: Env) {
           }
         }
 
-        const includeHistory = args.include_history ?? false;
+        const defaults = modeDefaults(mode);
+        const sections: SectionDefaults = {
+          always_load: args.include_always_load ?? defaults.always_load,
+          profile: args.include_profile ?? defaults.profile,
+          focus: args.include_focus ?? defaults.focus,
+          objectives: args.include_objectives ?? defaults.objectives,
+          projects: args.include_projects ?? defaults.projects,
+          pinned: args.include_pinned ?? defaults.pinned,
+          summaries: args.include_summaries ?? defaults.summaries,
+          history: args.include_history ?? defaults.history,
+        };
+
+        const relevantThreshold = mode === "minimal" ? 10 : 7;
 
         const [alwaysLoadItems, profileItems, activeObjectives, active_projects, pinnedItems] = await Promise.all([
-          db.loadContextItems(env.DB, { startup_priority_min: 10, current_only: true, include_history: false, limit: 20 }),
-          db.loadProfileItems(env.DB, { startup_priority_min: 7, limit: 20 }),
-          db.loadActiveObjectives(env.DB, { limit: 20, startupPriorityMin: 7 }),
-          db.loadActiveProjects(env.DB, 20),
-          db.loadPinnedItems(env.DB, { startup_priority_min: 7, limit: 20 }),
+          sections.always_load
+            ? db.loadContextItems(env.DB, { startup_priority_min: 10, current_only: true, include_history: false, limit: 20 })
+            : Promise.resolve([] as db.EnrichedTask[]),
+          sections.profile
+            ? db.loadProfileItems(env.DB, { startup_priority_min: relevantThreshold, limit: 20 })
+            : Promise.resolve([] as db.EnrichedTask[]),
+          sections.objectives
+            ? db.loadActiveObjectives(env.DB, { limit: 20, startupPriorityMin: relevantThreshold })
+            : Promise.resolve([] as db.EnrichedTask[]),
+          sections.projects
+            ? db.loadActiveProjects(env.DB, 20)
+            : Promise.resolve([] as db.Project[]),
+          sections.pinned
+            ? db.loadPinnedItems(env.DB, { startup_priority_min: relevantThreshold, limit: 20 })
+            : Promise.resolve([] as db.EnrichedTask[]),
         ]);
 
         const always_load = db.dedupeTasksById(alwaysLoadItems);
@@ -1141,22 +1287,28 @@ export function registerTools(server: McpServer, env: Env) {
           (item) => !alwaysLoadIds.has(item.id) && !profileIds.has(item.id) && !objectiveIds.has(item.id)
         );
 
+        const current_focus = sections.focus
+          ? serializeFocusContext(await db.getFocusContext(env.DB))
+          : null;
+
         const topics = args.topics ?? [];
-        const recent_summaries = await Promise.all(
-          topics.map(async (topic) => {
-            const scope = topic.toLowerCase();
-            const items = db.dedupeTasksById(
-              await db.loadContextItems(env.DB, {
-                tags: [scope],
-                startup_priority_min: 7,
-                current_only: true,
-                include_history: false,
-                limit: 50,
+        const recent_summaries = sections.summaries
+          ? await Promise.all(
+              topics.map(async (topic) => {
+                const scope = topic.toLowerCase();
+                const items = db.dedupeTasksById(
+                  await db.loadContextItems(env.DB, {
+                    tags: [scope],
+                    startup_priority_min: relevantThreshold,
+                    current_only: true,
+                    include_history: false,
+                    limit: 50,
+                  })
+                );
+                return { scope, summary: db.buildContextSummary(scope, items) };
               })
-            );
-            return { scope, summary: db.buildContextSummary(scope, items) };
-          })
-        );
+            )
+          : [];
 
         const seenForHistory = new Set([
           ...alwaysLoadIds,
@@ -1164,7 +1316,7 @@ export function registerTools(server: McpServer, env: Env) {
           ...objectiveIds,
           ...pinned_context.map((item) => item.id),
         ]);
-        const historical_background = includeHistory
+        const historical_background = sections.history
           ? db.dedupeTasksById(
               await db.loadContextItems(env.DB, {
                 startup_priority_min: 3,
@@ -1189,11 +1341,13 @@ export function registerTools(server: McpServer, env: Env) {
 
         const generated_at = new Date().toISOString();
         const bundle = {
+          mode,
           always_load: serializeTasksWithHistory(always_load, superseding),
           profile_context: serializeTasksWithHistory(profile_context, superseding),
           active_objectives: serializeTasksWithHistory(active_objectives, superseding),
           active_projects,
           pinned_context: serializeTasksWithHistory(pinned_context, superseding),
+          current_focus,
           historical_background: serializeTasksWithHistory(historical_background, superseding),
           recent_summaries,
           context_version: db.computeContextVersion(allStartupItems),

@@ -235,16 +235,13 @@ describe("buildContextSummary", () => {
     const summary = buildContextSummary("work", []);
     assert.strictEqual(summary.scope, "work");
     assert.strictEqual(summary.total, 0);
-    assert.deepStrictEqual(summary.by_kind, {});
-    assert.deepStrictEqual(summary.by_entity_type, {});
-    assert.deepStrictEqual(summary.by_lifecycle_state, {});
-    assert.strictEqual(summary.pinned_count, 0);
     assert.strictEqual(summary.active_count, 0);
-    assert.deepStrictEqual(summary.top_items, []);
+    assert.strictEqual(summary.pinned_count, 0);
+    assert.strictEqual(summary.top_item, null);
     assert.ok(typeof summary.generated_at === "string");
   });
 
-  it("counts by kind, entity_type, and lifecycle_state", () => {
+  it("counts totals and active/pinned items", () => {
     const items = [
       { id: 1, title: "A", item_kind: "task", entity_type: "tactical_task", lifecycle_state: "active", pinned: 0 },
       { id: 2, title: "B", item_kind: "task", entity_type: "strategic_goal", lifecycle_state: "active", pinned: 1 },
@@ -252,19 +249,12 @@ describe("buildContextSummary", () => {
     ] as unknown as import("./db.js").EnrichedTask[];
     const summary = buildContextSummary("health", items);
     assert.strictEqual(summary.total, 3);
-    assert.deepStrictEqual(summary.by_kind, { task: 2, memory: 1 });
-    assert.deepStrictEqual(summary.by_entity_type, { tactical_task: 1, strategic_goal: 1, context_memory: 1 });
-    assert.deepStrictEqual(summary.by_lifecycle_state, { active: 2, dormant: 1 });
     assert.strictEqual(summary.pinned_count, 1);
     assert.strictEqual(summary.active_count, 2);
-    assert.deepStrictEqual(summary.top_items, [
-      { id: 1, title: "A" },
-      { id: 2, title: "B" },
-      { id: 3, title: "C" },
-    ]);
+    assert.deepStrictEqual(summary.top_item, { id: 1, title: "A" });
   });
 
-  it("limits top_items to five", () => {
+  it("selects single top item from sorted input", () => {
     const items = Array.from({ length: 7 }, (_, i) => ({
       id: i + 1,
       title: `Task ${i + 1}`,
@@ -274,8 +264,6 @@ describe("buildContextSummary", () => {
       pinned: 0,
     })) as unknown as import("./db.js").EnrichedTask[];
     const summary = buildContextSummary("overflow", items);
-    assert.strictEqual(summary.top_items.length, 5);
-    assert.strictEqual(summary.top_items[0].id, 1);
-    assert.strictEqual(summary.top_items[4].id, 5);
+    assert.deepStrictEqual(summary.top_item, { id: 1, title: "Task 1" });
   });
 });

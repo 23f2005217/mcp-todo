@@ -245,41 +245,31 @@ export function computeLastConsolidated(items: EnrichedTask[]): string | null {
 export interface ContextSummary {
   scope: string;
   total: number;
-  by_kind: Record<string, number>;
-  by_entity_type: Record<string, number>;
-  by_lifecycle_state: Record<string, number>;
-  pinned_count: number;
   active_count: number;
-  top_items: Array<{ id: number; title: string }>;
+  pinned_count: number;
+  top_item: { id: number; title: string } | null;
   version: number;
   last_consolidated: string | null;
   generated_at: string;
 }
 
 export function buildContextSummary(scope: string, items: EnrichedTask[]): ContextSummary {
-  const by_kind: Record<string, number> = {};
-  const by_entity_type: Record<string, number> = {};
-  const by_lifecycle_state: Record<string, number> = {};
   let pinned_count = 0;
   let active_count = 0;
 
   for (const item of items) {
-    by_kind[item.item_kind] = (by_kind[item.item_kind] ?? 0) + 1;
-    by_entity_type[item.entity_type] = (by_entity_type[item.entity_type] ?? 0) + 1;
-    by_lifecycle_state[item.lifecycle_state] = (by_lifecycle_state[item.lifecycle_state] ?? 0) + 1;
     if (item.pinned === 1) pinned_count++;
     if (item.lifecycle_state === "active") active_count++;
   }
 
+  const top = items[0];
+
   return {
     scope,
     total: items.length,
-    by_kind,
-    by_entity_type,
-    by_lifecycle_state,
-    pinned_count,
     active_count,
-    top_items: items.slice(0, 5).map((item) => ({ id: item.id, title: item.title })),
+    pinned_count,
+    top_item: top ? { id: top.id, title: top.title } : null,
     version: computeContextVersion(items),
     last_consolidated: computeLastConsolidated(items),
     generated_at: new Date().toISOString(),
