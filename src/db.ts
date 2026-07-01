@@ -23,6 +23,7 @@ export interface Task {
   objective_id: number | null;
   completed: number;
   priority: number;
+  startup_priority: number;
   due_at: string | null;
   due_text: string | null;
   snoozed_until: string | null;
@@ -84,6 +85,8 @@ export interface ItemListQuery {
   archived?: boolean;
   pinned?: boolean;
   priority?: PriorityLevel[];
+  startup_priority_min?: number;
+  startup_priority_max?: number;
   q?: string;
   due_before?: string;
   due_after?: string;
@@ -337,6 +340,39 @@ export async function getTasksByIds(db: D1Database, ids: number[]): Promise<Task
   );
 }
 
+/**
+ * Load relationships where the given items are the target of a supersession,
+ * replacement, or derivation. Returns a map from target item id to the
+ * relationship records that mark it as historical.
+ */
+export async function getSupersedingRelationships(
+  db: D1Database,
+  itemIds: number[]
+): Promise<Map<number, RelationshipRecord[]>> {
+  if (itemIds.length === 0) return new Map();
+  const placeholders = itemIds.map(() => "?").join(", ");
+  const records = await db
+    .prepare(
+      `SELECT *
+       FROM item_relationships
+       WHERE target_item_id IN (${placeholders})
+         AND relationship_type IN ('supersedes', 'replaces', 'derived_from')
+       ORDER BY created_at DESC`
+    )
+    .bind(...itemIds)
+    .all()
+    .then((result) => result.results as Record<string, unknown>[]);
+
+  const byTarget = new Map<number, RelationshipRecord[]>();
+  for (const record of records) {
+    const targetId = Number(record.target_item_id);
+    const current = byTarget.get(targetId) ?? [];
+    current.push(record as unknown as RelationshipRecord);
+    byTarget.set(targetId, current);
+  }
+  return byTarget;
+}
+
 async function getTaskTagsMap(db: D1Database, taskIds: number[]): Promise<Map<number, Tag[]>> {
   if (taskIds.length === 0) return new Map();
   const placeholders = taskIds.map(() => "?").join(", ");
@@ -479,6 +515,7 @@ export async function createTask(
     lifecycle_state?: LifecycleState;
     objective_id?: number | null;
     priority: PriorityLevel;
+    startup_priority?: number;
     due_at?: string | null;
     due_text?: string | null;
     project?: { slug?: string; name?: string; description?: string | null } | null;
@@ -510,6 +547,7 @@ export async function createTask(
         objective_id,
         completed,
         priority,
+        startup_priority,
         due_at,
         due_text,
         snoozed_until,
@@ -531,7 +569,7 @@ export async function createTask(
         superseded_at,
         created_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, datetime(?, '+21 days'), ?, ?, NULL, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, datetime(?, '+21 days'), ?, ?, NULL, ?, ?)`
     )
     .bind(
       input.title.trim(),
@@ -542,6 +580,7 @@ export async function createTask(
       lifecycleState,
       input.objective_id ?? null,
       input.priority,
+      input.startup_priority ?? 7,
       input.due_at ?? null,
       input.due_text ?? null,
       input.pinned ? 1 : 0,
@@ -588,6 +627,7 @@ export async function updateTask(
     objective_id?: number | null;
     clear_objective?: boolean;
     priority?: PriorityLevel;
+    startup_priority?: number | null;
     due_at?: string | null;
     due_text?: string | null;
     clear_due?: boolean;
@@ -658,6 +698,14 @@ export async function updateTask(
   if (changes.priority !== undefined) {
     sets.push("priority = ?");
     params.push(changes.priority);
+  }
+  if (changes.startup_priority !== undefined) {
+    sets.push("startup_priority = ?");
+    params.push(
+      changes.startup_priority === null
+        ? 7
+        : Math.min(Math.max(Math.trunc(changes.startup_priority), 1), 10)
+    );
   }
   if (changes.clear_due) {
     sets.push("due_at = NULL");
@@ -790,6 +838,14 @@ export async function listItems(db: D1Database, query: ItemListQuery): Promise<T
   if (query.priority && query.priority.length > 0) {
     where.push(`t.priority IN (${query.priority.map(() => "?").join(", ")})`);
     params.push(...query.priority);
+  }
+  if (typeof query.startup_priority_min === "number") {
+    where.push("t.startup_priority >= ?");
+    params.push(Math.trunc(query.startup_priority_min));
+  }
+  if (typeof query.startup_priority_max === "number") {
+    where.push("t.startup_priority <= ?");
+    params.push(Math.trunc(query.startup_priority_max));
   }
   if (query.due_before) {
     where.push("t.due_at <= ?");
@@ -1335,3 +1391,18 @@ export async function logEvent(
     .bind(itemId, projectId, eventType, JSON.stringify(metadata))
     .run();
 }
+
+// Context retrieval helpers are implemented in ./context.ts
+export {
+  ContextLoadQuery,
+  ContextSummary,
+  buildContextSummary,
+  computeContextVersion,
+  computeLastConsolidated,
+  dedupeTasksById,
+  loadContextItems,
+  loadPinnedItems,
+  loadProfileItems,
+  loadActiveObjectives,
+  loadActiveProjects,
+} from "./context.js";

@@ -4,7 +4,16 @@ import * as db from "./db.js";
 import { parseDueDate } from "./due.js";
 import { getAppSettings, updateAppSettings } from "./settings.js";
 import { deleteTaskVector, semanticSearchTaskIds, upsertTaskVectors } from "./vectorize.js";
+import {
+  getCachedContextSummary,
+  setCachedContextSummary,
+  getCachedStartupContext,
+  setCachedStartupContext,
+  invalidateContextCache,
+  invalidateAllContextCaches,
+} from "./context-cache.js";
 
+// Context cache key namespaces: context:summary:<scope> and context:startup
 const ACTIVE_FOCUS_KEY = "focus:active";
 const ACTIVE_FOCUS_TTL_SECONDS = 120;
 
@@ -54,7 +63,7 @@ function toPriority(value?: string): db.PriorityLevel {
   return db.PRIORITY_VALUES[value ?? "medium"] ?? 2;
 }
 
-function serializeTask(task: db.EnrichedTask) {
+function baseTaskFields(task: db.EnrichedTask) {
   return {
     id: task.id,
     title: task.title,
@@ -67,6 +76,7 @@ function serializeTask(task: db.EnrichedTask) {
     completed: task.completed === 1,
     priority: db.PRIORITY_NAMES[(task.priority as db.PriorityLevel) ?? 2] ?? "medium",
     priority_level: task.priority,
+    startup_priority: task.startup_priority,
     due_at: task.due_at,
     due_text: task.due_text,
     snoozed_until: task.snoozed_until,
@@ -90,6 +100,35 @@ function serializeTask(task: db.EnrichedTask) {
     group: task.group,
     tags: task.tags,
   };
+}
+
+function serializeTask(task: db.EnrichedTask) {
+  return baseTaskFields(task);
+}
+
+function serializeTaskWithHistory(
+  task: db.EnrichedTask,
+  relationships: db.RelationshipRecord[] | undefined
+) {
+  if (!relationships || relationships.length === 0) {
+    return baseTaskFields(task);
+  }
+  return {
+    ...baseTaskFields(task),
+    historical: true as const,
+    superseded_by: relationships.map((relationship) => ({
+      source_item_id: relationship.source_item_id,
+      relationship_type: relationship.relationship_type,
+      created_at: relationship.created_at,
+    })),
+  };
+}
+
+function serializeTasksWithHistory(
+  tasks: db.EnrichedTask[],
+  superseding: Map<number, db.RelationshipRecord[]>
+) {
+  return tasks.map((task) => serializeTaskWithHistory(task, superseding.get(task.id)));
 }
 
 function serializeFocusContext(context: db.FocusContext) {
@@ -235,7 +274,11 @@ export function registerTools(server: McpServer, env: Env) {
       default_snooze_hours: z.number().int().min(1).max(24 * 30).optional(),
     },
     { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
-    async (args) => ok(await updateAppSettings(env.APP_KV, args))
+    async (args) => {
+      const settings = await updateAppSettings(env.APP_KV, args);
+      await invalidateContextCache(env.APP_KV);
+      return ok(settings);
+    }
   );
 
   server.tool(
@@ -267,6 +310,7 @@ export function registerTools(server: McpServer, env: Env) {
       group_name: z.string().optional(),
       tags: z.array(z.string()).optional(),
       pinned: z.boolean().optional(),
+      startup_priority: z.number().int().min(1).max(10).optional().describe("Startup priority: 10 always load, 7 load if relevant, 3 historical/background, 1 ignore unless requested"),
       recurrence_kind: recurrenceSchema.optional(),
       recurrence_interval: z.number().int().min(1).max(365).optional(),
       recurrence_until: z.string().optional(),
@@ -285,6 +329,7 @@ export function registerTools(server: McpServer, env: Env) {
           lifecycle_state: args.lifecycle_state,
           objective_id: args.objective_id ?? null,
           priority: toPriority(args.priority ?? settings.default_quick_add_priority),
+          startup_priority: args.startup_priority,
           due_at: parsedDue.due_at,
           due_text: parsedDue.normalized,
           project: args.project_slug || args.project_name
@@ -301,6 +346,7 @@ export function registerTools(server: McpServer, env: Env) {
         });
         await clearActiveFocus(env.APP_KV);
         await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
         return ok({ item: serializeTask(task) });
       } catch (error: unknown) {
         return err(`Failed to create item: ${error instanceof Error ? error.message : String(error)}`);
@@ -316,6 +362,7 @@ export function registerTools(server: McpServer, env: Env) {
       item_kind: itemKindSchema.optional(),
       due: z.string().optional(),
       priority: prioritySchema.optional(),
+      startup_priority: z.number().int().min(1).max(10).optional().describe("Startup priority: 10 always load, 7 load if relevant, 3 historical/background, 1 ignore unless requested"),
     },
     { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
     async (args) => {
@@ -331,6 +378,7 @@ export function registerTools(server: McpServer, env: Env) {
           raw_input: args.input.trim(),
           item_kind: parsed.itemKind,
           priority: toPriority(args.priority ?? settings.default_quick_add_priority),
+          startup_priority: args.startup_priority,
           due_at: parsedDue.due_at,
           due_text: parsedDue.normalized,
           project: parsed.projectSlug ? { slug: parsed.projectSlug, name: parsed.projectSlug } : null,
@@ -340,6 +388,7 @@ export function registerTools(server: McpServer, env: Env) {
 
         await clearActiveFocus(env.APP_KV);
         await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
         return ok({ item: serializeTask(task) });
       } catch (error: unknown) {
         return err(`Failed to capture item: ${error instanceof Error ? error.message : String(error)}`);
@@ -356,6 +405,7 @@ export function registerTools(server: McpServer, env: Env) {
       project_slug: z.string().optional(),
       group_slug: z.string().optional(),
       pinned: z.boolean().optional(),
+      startup_priority: z.number().int().min(1).max(10).optional().describe("Startup priority: 10 always load, 7 load if relevant, 3 historical/background, 1 ignore unless requested"),
     },
     { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
     async (args) => {
@@ -375,8 +425,10 @@ export function registerTools(server: McpServer, env: Env) {
             : null,
           tags: normalizeTags([...(args.tags ?? []), ...parsed.tags]),
           pinned: args.pinned,
+          startup_priority: args.startup_priority,
         });
         await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
         return ok({ item: serializeTask(task) });
       } catch (error: unknown) {
         return err(`Failed to capture context: ${error instanceof Error ? error.message : String(error)}`);
@@ -407,6 +459,8 @@ export function registerTools(server: McpServer, env: Env) {
       archived: z.boolean().optional(),
       pinned: z.boolean().optional(),
       priority: z.array(prioritySchema).optional(),
+      startup_priority_min: z.number().int().min(1).max(10).optional(),
+      startup_priority_max: z.number().int().min(1).max(10).optional(),
       q: z.string().optional().describe("FTS query over title, description, raw input"),
       due_before: z.string().optional(),
       due_after: z.string().optional(),
@@ -430,6 +484,8 @@ export function registerTools(server: McpServer, env: Env) {
           archived: args.archived,
           pinned: args.pinned,
           priority: args.priority?.map((value) => toPriority(value)),
+          startup_priority_min: args.startup_priority_min,
+          startup_priority_max: args.startup_priority_max,
           q: toFtsQuery(args.q),
           due_before: args.due_before,
           due_after: args.due_after,
@@ -445,6 +501,47 @@ export function registerTools(server: McpServer, env: Env) {
         return ok({ items: enriched.map(serializeTask), count: enriched.length });
       } catch (error: unknown) {
         return err(`Failed to list items: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "load_context",
+    "Load context items deterministically by tags, projects, groups, pinned status, profile associations, and current state",
+    {
+      tags: z.array(z.string()).optional(),
+      project_slugs: z.array(z.string()).optional(),
+      group_slugs: z.array(z.string()).optional(),
+      profile: z.boolean().optional().describe("Load items tagged/grouped as profile"),
+      pinned: z.boolean().optional().describe("Filter by pinned status"),
+      current_only: z.boolean().optional().default(true).describe("Exclude superseded/archived/completed items"),
+      include_history: z.boolean().optional().describe("Include historical items even when current_only is true"),
+      kinds: z.array(itemKindSchema).optional(),
+      entity_types: z.array(entityTypeSchema).optional(),
+      startup_priority_min: z.number().int().min(1).max(10).optional(),
+      startup_priority_max: z.number().int().min(1).max(10).optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    },
+    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const tasks = await db.loadContextItems(env.DB, {
+          tags: args.tags?.map((tag) => tag.toLowerCase()),
+          project_slugs: args.project_slugs?.map((slug) => slug.toLowerCase()),
+          group_slugs: args.group_slugs?.map((slug) => slug.toLowerCase()),
+          profile: args.profile,
+          pinned: args.pinned,
+          current_only: args.current_only,
+          include_history: args.include_history,
+          kinds: args.kinds,
+          entity_types: args.entity_types,
+          startup_priority_min: args.startup_priority_min,
+          startup_priority_max: args.startup_priority_max,
+          limit: args.limit,
+        });
+        return ok({ items: tasks.map(serializeTask), count: tasks.length });
+      } catch (error: unknown) {
+        return err(`Failed to load context: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );
@@ -474,6 +571,7 @@ export function registerTools(server: McpServer, env: Env) {
       tags: z.array(z.string()).optional(),
       pinned: z.boolean().optional(),
       archived: z.boolean().optional(),
+      startup_priority: z.number().int().min(1).max(10).nullable().optional().describe("Startup priority: 10 always load, 7 load if relevant, 3 historical/background, 1 ignore unless requested"),
       recurrence_kind: recurrenceSchema.nullable().optional(),
       recurrence_interval: z.number().int().min(1).max(365).nullable().optional(),
       recurrence_until: z.string().nullable().optional(),
@@ -503,6 +601,7 @@ export function registerTools(server: McpServer, env: Env) {
           tags: args.tags ? normalizeTags(args.tags) : undefined,
           pinned: args.pinned,
           archived: args.archived,
+          startup_priority: args.startup_priority === null ? null : args.startup_priority,
           recurrence_kind: args.recurrence_kind === undefined ? undefined : args.recurrence_kind,
           recurrence_interval: args.recurrence_interval === undefined ? undefined : args.recurrence_interval,
           recurrence_until: args.recurrence_until === undefined ? undefined : args.recurrence_until,
@@ -512,6 +611,7 @@ export function registerTools(server: McpServer, env: Env) {
         if (!task) return err(`Item '${args.id}' not found`);
         await clearActiveFocus(env.APP_KV);
         await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
         return ok({ item: serializeTask(task) });
       } catch (error: unknown) {
         return err(`Failed to update item: ${error instanceof Error ? error.message : String(error)}`);
@@ -534,6 +634,7 @@ export function registerTools(server: McpServer, env: Env) {
         } catch {
           // D1 delete already succeeded.
         }
+        await invalidateContextCache(env.APP_KV);
         return ok({ deleted: true, id: args.id });
       } catch (error: unknown) {
         return err(`Failed to delete item: ${error instanceof Error ? error.message : String(error)}`);
@@ -559,6 +660,7 @@ export function registerTools(server: McpServer, env: Env) {
             // Keep deleting remaining vectors.
           }
         }
+        await invalidateContextCache(env.APP_KV);
         return ok({ deleted, ids: args.ids });
       } catch (error: unknown) {
         return err(`Failed to delete items: ${error instanceof Error ? error.message : String(error)}`);
@@ -637,6 +739,7 @@ export function registerTools(server: McpServer, env: Env) {
         });
         await clearActiveFocus(env.APP_KV);
         await syncVectorForTask(env, result.item);
+        await invalidateContextCache(env.APP_KV);
         return ok({
           project: result.project,
           objective: result.objective,
@@ -669,6 +772,7 @@ export function registerTools(server: McpServer, env: Env) {
           }
         }
         await syncVectorForTask(env, result.source);
+        await invalidateContextCache(env.APP_KV);
         return ok({
           source: serializeTask(result.source),
           superseded: result.superseded.map(serializeTask),
@@ -711,6 +815,7 @@ export function registerTools(server: McpServer, env: Env) {
         for (const item of items) {
           await syncVectorForTask(env, item);
         }
+        await invalidateContextCache(env.APP_KV);
         return ok({ items: items.map(serializeTask), count: items.length });
       } catch (error: unknown) {
         return err(`Failed to mark stale candidates: ${error instanceof Error ? error.message : String(error)}`);
@@ -740,6 +845,7 @@ export function registerTools(server: McpServer, env: Env) {
         } else {
           await syncVectorForTask(env, result.task);
         }
+        await invalidateContextCache(env.APP_KV);
         return ok({ changed: result.changed, item: serializeTask(result.task) });
       } catch (error: unknown) {
         return err(`Failed to update task state: ${error instanceof Error ? error.message : String(error)}`);
@@ -881,7 +987,11 @@ export function registerTools(server: McpServer, env: Env) {
       description: z.string().optional(),
     },
     { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
-    async (args) => ok({ project: await db.upsertProject(env.DB, args) })
+    async (args) => {
+      const project = await db.upsertProject(env.DB, args);
+      await invalidateContextCache(env.APP_KV);
+      return ok({ project });
+    }
   );
 
   server.tool(
@@ -889,7 +999,11 @@ export function registerTools(server: McpServer, env: Env) {
     "Delete a project by slug",
     { slug: z.string().min(1) },
     { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
-    async (args) => ok({ deleted: await db.deleteProject(env.DB, args.slug.toLowerCase()) })
+    async (args) => {
+      const deleted = await db.deleteProject(env.DB, args.slug.toLowerCase());
+      await invalidateContextCache(env.APP_KV);
+      return ok({ deleted });
+    }
   );
 
   server.tool(
@@ -909,7 +1023,11 @@ export function registerTools(server: McpServer, env: Env) {
       description: z.string().optional(),
     },
     { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
-    async (args) => ok({ group: await db.upsertGroup(env.DB, args) })
+    async (args) => {
+      const group = await db.upsertGroup(env.DB, args);
+      await invalidateContextCache(env.APP_KV);
+      return ok({ group });
+    }
   );
 
   server.tool(
@@ -917,7 +1035,11 @@ export function registerTools(server: McpServer, env: Env) {
     "Delete a group by slug",
     { slug: z.string().min(1) },
     { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
-    async (args) => ok({ deleted: await db.deleteGroup(env.DB, args.slug.toLowerCase()) })
+    async (args) => {
+      const deleted = await db.deleteGroup(env.DB, args.slug.toLowerCase());
+      await invalidateContextCache(env.APP_KV);
+      return ok({ deleted });
+    }
   );
 
   server.tool(
@@ -927,4 +1049,175 @@ export function registerTools(server: McpServer, env: Env) {
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async () => ok({ tags: await db.listTags(env.DB) })
   );
+
+  server.tool(
+    "get_context_summary",
+    "Return a deterministic rollup summary of current context for a topic or project",
+    {
+      scope: z.string().min(1).optional().describe("Topic or project slug (e.g. work, health, my-project)"),
+      topic: z.string().optional().describe("Alias for scope; lowercased tag/topic slug"),
+      project_slug: z.string().optional().describe("Project slug; if provided, summary is project-scoped"),
+      use_cache: z.boolean().optional().default(true).describe("Whether to read/write KV cache"),
+    },
+    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const effectiveScope = (args.scope ?? args.topic ?? args.project_slug ?? "").toLowerCase();
+        if (!effectiveScope) {
+          return err("Provide scope, topic, or project_slug");
+        }
+
+        const useCache = args.use_cache ?? true;
+        if (useCache) {
+          const cached = await getCachedContextSummary(env.APP_KV, effectiveScope);
+          if (cached) {
+            return ok({ scope: effectiveScope, source: "kv_cache", summary: cached });
+          }
+        }
+
+        const projectSlug = args.project_slug?.toLowerCase();
+        const items = await db.loadContextItems(env.DB, {
+          tags: [effectiveScope],
+          project_slugs: projectSlug ? [projectSlug] : undefined,
+          current_only: true,
+          include_history: false,
+          limit: 50,
+        });
+
+        const summary = db.buildContextSummary(effectiveScope, items);
+        if (useCache) {
+          await setCachedContextSummary(env.APP_KV, effectiveScope, summary);
+        }
+        return ok({ scope: effectiveScope, source: "d1", summary });
+      } catch (error: unknown) {
+        return err(`Failed to get context summary: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "get_startup_context",
+    "Return a bundled conversation startup loadout: always-load items, profile context, active objectives, active projects, pinned context, recent summaries, and optional historical background",
+    {
+      topics: z.array(z.string()).optional().describe("Topic/project slugs to include in recent summaries"),
+      include_history: z.boolean().optional().default(false).describe("Include priority-3 historical/background items"),
+      use_cache: z.boolean().optional().default(true),
+    },
+    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const useCache = args.use_cache ?? true;
+        if (useCache) {
+          const cached = await getCachedStartupContext(env.APP_KV);
+          if (cached) {
+            return ok({ source: "kv_cache", ...(cached as Record<string, unknown>) });
+          }
+        }
+
+        const includeHistory = args.include_history ?? false;
+
+        const [alwaysLoadItems, profileItems, activeObjectives, active_projects, pinnedItems] = await Promise.all([
+          db.loadContextItems(env.DB, { startup_priority_min: 10, current_only: true, include_history: false, limit: 20 }),
+          db.loadProfileItems(env.DB, { startup_priority_min: 7, limit: 20 }),
+          db.loadActiveObjectives(env.DB, { limit: 20, startupPriorityMin: 7 }),
+          db.loadActiveProjects(env.DB, 20),
+          db.loadPinnedItems(env.DB, { startup_priority_min: 7, limit: 20 }),
+        ]);
+
+        const always_load = db.dedupeTasksById(alwaysLoadItems);
+        const alwaysLoadIds = new Set(always_load.map((item) => item.id));
+
+        const profile_context = db.dedupeTasksById(profileItems).filter(
+          (item) => !alwaysLoadIds.has(item.id)
+        );
+        const profileIds = new Set(profile_context.map((item) => item.id));
+
+        const active_objectives = db.dedupeTasksById(activeObjectives).filter(
+          (item) => !alwaysLoadIds.has(item.id) && !profileIds.has(item.id)
+        );
+        const objectiveIds = new Set(active_objectives.map((item) => item.id));
+
+        const pinned_context = db.dedupeTasksById(pinnedItems).filter(
+          (item) => !alwaysLoadIds.has(item.id) && !profileIds.has(item.id) && !objectiveIds.has(item.id)
+        );
+
+        const topics = args.topics ?? [];
+        const recent_summaries = await Promise.all(
+          topics.map(async (topic) => {
+            const scope = topic.toLowerCase();
+            const items = db.dedupeTasksById(
+              await db.loadContextItems(env.DB, {
+                tags: [scope],
+                startup_priority_min: 7,
+                current_only: true,
+                include_history: false,
+                limit: 50,
+              })
+            );
+            return { scope, summary: db.buildContextSummary(scope, items) };
+          })
+        );
+
+        const seenForHistory = new Set([
+          ...alwaysLoadIds,
+          ...profileIds,
+          ...objectiveIds,
+          ...pinned_context.map((item) => item.id),
+        ]);
+        const historical_background = includeHistory
+          ? db.dedupeTasksById(
+              await db.loadContextItems(env.DB, {
+                startup_priority_min: 3,
+                startup_priority_max: 3,
+                include_history: true,
+                limit: 20,
+              })
+            ).filter((item) => !seenForHistory.has(item.id))
+          : [];
+
+        const allStartupItems = [
+          ...always_load,
+          ...profile_context,
+          ...active_objectives,
+          ...pinned_context,
+          ...historical_background,
+        ];
+        const superseding = await db.getSupersedingRelationships(
+          env.DB,
+          allStartupItems.map((item) => item.id)
+        );
+
+        const generated_at = new Date().toISOString();
+        const bundle = {
+          always_load: serializeTasksWithHistory(always_load, superseding),
+          profile_context: serializeTasksWithHistory(profile_context, superseding),
+          active_objectives: serializeTasksWithHistory(active_objectives, superseding),
+          active_projects,
+          pinned_context: serializeTasksWithHistory(pinned_context, superseding),
+          historical_background: serializeTasksWithHistory(historical_background, superseding),
+          recent_summaries,
+          context_version: db.computeContextVersion(allStartupItems),
+          last_consolidated: db.computeLastConsolidated(profile_context),
+          generated_at,
+        };
+
+        if (useCache) {
+          await setCachedStartupContext(env.APP_KV, bundle);
+        }
+
+        return ok({ source: "d1", ...bundle });
+      } catch (error: unknown) {
+        return err(`Failed to get startup context: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
 }
+
+export {
+  getCachedContextSummary,
+  setCachedContextSummary,
+  getCachedStartupContext,
+  setCachedStartupContext,
+  invalidateContextCache,
+  invalidateAllContextCaches,
+} from "./context-cache.js";

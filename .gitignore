@@ -165,3 +165,10 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# Test output
+
+dist-test/
+
+# Kimchi workspace metadata
+.kimchi/
