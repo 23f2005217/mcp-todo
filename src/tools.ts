@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as db from "./db.js";
+import * as ctx from "./context.js";
 import { parseDueDate } from "./due.js";
 import { getAppSettings, updateAppSettings } from "./settings.js";
 import { deleteTaskVector, semanticSearchTaskIds, upsertTaskVectors } from "./vectorize.js";
@@ -9,6 +10,8 @@ import {
   setCachedContextSummary,
   getCachedStartupContext,
   setCachedStartupContext,
+  getCachedProjectContext,
+  setCachedProjectContext,
   invalidateContextCache,
   invalidateAllContextCaches,
 } from "./context-cache.js";
@@ -106,30 +109,6 @@ function serializeTask(task: db.EnrichedTask) {
   return baseTaskFields(task);
 }
 
-function serializeTaskWithHistory(
-  task: db.EnrichedTask,
-  relationships: db.RelationshipRecord[] | undefined
-) {
-  if (!relationships || relationships.length === 0) {
-    return baseTaskFields(task);
-  }
-  return {
-    ...baseTaskFields(task),
-    historical: true as const,
-    superseded_by: relationships.map((relationship) => ({
-      source_item_id: relationship.source_item_id,
-      relationship_type: relationship.relationship_type,
-      created_at: relationship.created_at,
-    })),
-  };
-}
-
-function serializeTasksWithHistory(
-  tasks: db.EnrichedTask[],
-  superseding: Map<number, db.RelationshipRecord[]>
-) {
-  return tasks.map((task) => serializeTaskWithHistory(task, superseding.get(task.id)));
-}
 
 function serializeFocusContext(context: db.FocusContext) {
   return {
@@ -145,51 +124,78 @@ function serializeFocusContext(context: db.FocusContext) {
   };
 }
 
-interface SectionDefaults {
-  always_load: boolean;
-  profile: boolean;
-  focus: boolean;
-  objectives: boolean;
-  projects: boolean;
-  pinned: boolean;
-  summaries: boolean;
-  history: boolean;
+function serializeFocusSnapshot(context: ctx.FocusSnapshot) {
+  return {
+    project: context.project,
+    objective_id: context.objective_id,
+    strategic_focus: context.strategic_focus ? serializeTask(context.strategic_focus) : null,
+    tactical_next_step: context.tactical_next_step ? serializeTask(context.tactical_next_step) : null,
+    focus_version: context.focus_version,
+    generated_at: context.generated_at,
+  };
 }
 
-function modeDefaults(mode: "minimal" | "normal" | "full"): SectionDefaults {
-  if (mode === "minimal") {
-    return {
-      always_load: true,
-      profile: true,
-      focus: true,
-      objectives: false,
-      projects: true,
-      pinned: true,
-      summaries: false,
-      history: false,
-    };
-  }
-  if (mode === "full") {
-    return {
-      always_load: true,
-      profile: true,
-      focus: true,
-      objectives: true,
-      projects: true,
-      pinned: true,
-      summaries: true,
-      history: true,
-    };
-  }
+function serializeContextSummary(summary: ctx.ContextSummary) {
   return {
-    always_load: true,
-    profile: true,
-    focus: true,
-    objectives: true,
-    projects: true,
-    pinned: true,
-    summaries: true,
-    history: false,
+    scope: summary.scope,
+    total: summary.total,
+    active_count: summary.active_count,
+    pinned_count: summary.pinned_count,
+    top_item: summary.top_item,
+    version: summary.version,
+    last_consolidated: summary.last_consolidated,
+    generated_at: summary.generated_at,
+  };
+}
+
+function serializeTopicSummary(bundle: ctx.TopicSummaryBundle) {
+  return {
+    level: bundle.level,
+    scope: bundle.scope,
+    group: bundle.group,
+    canonical_item: bundle.canonical_item ? serializeTask(bundle.canonical_item) : null,
+    summary: serializeContextSummary(bundle.summary),
+    source: bundle.source,
+    generated_at: bundle.generated_at,
+  };
+}
+
+function serializeStartupContext(bundle: ctx.StartupContextBundle) {
+  return {
+    level: bundle.level,
+    source: bundle.source,
+    context_version: bundle.context_version,
+    generated_at: bundle.generated_at,
+    last_consolidated: bundle.last_consolidated,
+    profile: bundle.profile ? serializeTask(bundle.profile) : null,
+    active_goals: bundle.active_goals.map(serializeTask),
+    current_focus: serializeFocusSnapshot(bundle.current_focus),
+    active_projects: bundle.active_projects,
+    always_load: bundle.always_load.map(serializeTask),
+    topic_summaries: bundle.topic_summaries.map(serializeTopicSummary),
+  };
+}
+
+function serializeProjectContext(bundle: ctx.ProjectContextBundle) {
+  return {
+    level: bundle.level,
+    source: bundle.source,
+    project: bundle.project,
+    active_objective: bundle.active_objective ? serializeTask(bundle.active_objective) : null,
+    active_items: bundle.active_items.map(serializeTask),
+    recurring_systems: bundle.recurring_systems.map(serializeTask),
+    history: bundle.history.map(serializeTask),
+    generated_at: bundle.generated_at,
+  };
+}
+
+function serializeRawMemories(bundle: ctx.RawMemoriesBundle) {
+  return {
+    level: bundle.level,
+    source: bundle.source,
+    items: bundle.items.map(serializeTask),
+    count: bundle.count,
+    generated_at: bundle.generated_at,
   };
 }
 
@@ -310,7 +316,7 @@ async function syncVectorForTask(env: Env, task: db.EnrichedTask) {
 export function registerTools(server: McpServer, env: Env) {
   server.tool(
     "get_app_settings",
-    "Get app-level defaults used by capture and state transitions",
+    "Read current app defaults (capture kind, priority, snooze hours, upcoming days). Use to understand defaults before creating items or to check current configuration.",
     {},
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async () => ok(await getAppSettings(env.APP_KV))
@@ -318,7 +324,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "update_app_settings",
-    "Update app-level defaults used by capture and state transitions",
+    "Change app-wide defaults (capture kind, priority, snooze hours, upcoming days). Use when the user wants to change default behavior for future captures or snoozes.",
     {
       default_quick_add_priority: prioritySchema.optional(),
       default_capture_kind: itemKindSchema.optional(),
@@ -335,7 +341,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "parse_due_date",
-    "Parse a human due-date string into a normalized ISO timestamp",
+    "Parse a human due date string (e.g. 'tomorrow', 'next friday', 'in 3 days') into an ISO timestamp. Use when you need to validate or preview what a due date resolves to before creating or updating an item.",
     {
       input: z.string().min(1),
     },
@@ -345,7 +351,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "create_item",
-    "Create a task or memory item with optional due date, recurrence, project, group, and tags",
+    "Create a new task or memory with full metadata (title, description, priority, due date, project, group, tags, recurrence, startup priority). Prefer quick_capture for simple inputs. Always run find_semantic_conflicts first to avoid duplicates.",
     {
       title: z.string().min(1),
       description: z.string().optional(),
@@ -408,7 +414,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "quick_capture",
-    "Fast capture for raw task or memory input with hashtags and lightweight metadata hints",
+    "Fastest way to capture a task from natural language. Parses hashtags (#tag), project (+project), group (@group), and due dates (due:...) automatically. Use instead of create_item for simple quick-adds. Do NOT use for memories—use capture_context instead.",
     {
       input: z.string().min(1),
       item_kind: itemKindSchema.optional(),
@@ -450,7 +456,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "capture_context",
-    "Capture a memory/context item quickly without forcing task semantics",
+    "Capture a memory or context note. Use only when no suitable existing memory exists—prefer update_item for existing items. Use before capture to check for duplicates with find_semantic_conflicts. Use capture_context instead of quick_capture for non-actionable knowledge.",
     {
       input: z.string().min(1),
       tags: z.array(z.string()).optional(),
@@ -490,7 +496,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "get_item",
-    "Fetch a single item by id",
+    "Fetch a single item by its numeric id. Use when you already know the item id (e.g. from a previous tool result). Do NOT use for discovery—use list_items, semantic_search, or context loading tools instead.",
     { id: z.number().int().positive() },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async (args) => {
@@ -501,7 +507,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "list_items",
-    "List items with rich filtering and sorting across tasks and memories",
+    "List and filter items by kind, status, project, group, tags, due date, priority, or text search. Use for targeted queries when semantic_search is too broad. Prefer context loading tools (get_startup_context, get_context_summary, get_focus_context) for general context gathering.",
     {
       ids: z.array(z.number().int().positive()).optional(),
       kinds: z.array(itemKindSchema).optional(),
@@ -557,27 +563,92 @@ export function registerTools(server: McpServer, env: Env) {
     }
   );
 
+  const contextLevelSchema = z.enum(["startup", "topic_summary", "project", "raw_memories"]);
+
   server.tool(
     "load_context",
-    "Load context items deterministically by tags, projects, groups, pinned status, profile associations, and current state",
+    "Load context at a specific hierarchy level. Always follow this retrieval order: startup → topic_summary → project → raw_memories. Use startup for general conversations, topic_summary for topic-specific questions (e.g. 'my AWS setup'), project for project-specific work. Use raw_memories ONLY as a last resort when higher-level summaries cannot answer the request. Prefer get_startup_context, get_context_summary, and get_focus_context for most use cases.",
     {
-      tags: z.array(z.string()).optional(),
-      project_slugs: z.array(z.string()).optional(),
-      group_slugs: z.array(z.string()).optional(),
-      profile: z.boolean().optional().describe("Load items tagged/grouped as profile"),
-      pinned: z.boolean().optional().describe("Filter by pinned status"),
-      current_only: z.boolean().optional().default(true).describe("Exclude superseded/archived/completed items"),
-      include_history: z.boolean().optional().describe("Include historical items even when current_only is true"),
+      level: contextLevelSchema.optional().default("raw_memories").describe("Hierarchy level to load"),
+      topic: z.string().optional().describe("Topic/group slug for level=topic_summary"),
+      project_slug: z.string().optional().describe("Project slug for level=project"),
+      include_history: z.boolean().optional().describe("Include historical items for level=project or raw_memories"),
+      tags: z.array(z.string()).optional().describe("Tag slugs for level=raw_memories"),
+      project_slugs: z.array(z.string()).optional().describe("Project slugs for level=raw_memories"),
+      group_slugs: z.array(z.string()).optional().describe("Group slugs for level=raw_memories"),
+      profile: z.boolean().optional().describe("Load profile items (raw_memories level)"),
+      pinned: z.boolean().optional().describe("Filter by pinned status (raw_memories level)"),
+      current_only: z.boolean().optional().default(true).describe("Exclude superseded/archived/completed items (raw_memories level)"),
       kinds: z.array(itemKindSchema).optional(),
       entity_types: z.array(entityTypeSchema).optional(),
-      startup_priority_min: z.number().int().min(1).max(10).optional(),
-      startup_priority_max: z.number().int().min(1).max(10).optional(),
+      startup_priority_min: z.number().int().min(0).max(10).optional(),
+      startup_priority_max: z.number().int().min(0).max(10).optional(),
       limit: z.number().int().min(1).max(100).optional(),
+      use_cache: z.boolean().optional().default(true).describe("Read/write KV cache for startup/topic/project levels"),
     },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async (args) => {
       try {
-        const tasks = await db.loadContextItems(env.DB, {
+        const level = args.level ?? "raw_memories";
+        const useCache = args.use_cache ?? true;
+
+        if (level === "startup") {
+          if (useCache) {
+            const cached = await getCachedStartupContext(env.APP_KV);
+            if (cached) {
+              return ok({ source: "kv_cache", ...(cached as Record<string, unknown>) });
+            }
+          }
+          const bundle = await ctx.loadStartupContext(env.DB);
+          const serialized = serializeStartupContext(bundle);
+          if (useCache) {
+            await setCachedStartupContext(env.APP_KV, serialized);
+          }
+          return ok(serialized);
+        }
+
+        if (level === "topic_summary") {
+          const scope = args.topic?.toLowerCase();
+          if (!scope) {
+            return err("Provide topic for level=topic_summary");
+          }
+          if (useCache) {
+            const cached = await getCachedContextSummary(env.APP_KV, scope);
+            if (cached) {
+              return ok({ scope, source: "kv_cache", summary: cached });
+            }
+          }
+          const bundle = await ctx.loadTopicSummary(env.DB, scope);
+          const serialized = serializeTopicSummary(bundle);
+          if (useCache) {
+            await setCachedContextSummary(env.APP_KV, scope, serialized);
+          }
+          return ok(serialized);
+        }
+
+        if (level === "project") {
+          const slug = args.project_slug?.toLowerCase();
+          if (!slug) {
+            return err("Provide project_slug for level=project");
+          }
+          if (useCache) {
+            const cached = await getCachedProjectContext(env.APP_KV, slug);
+            if (cached) {
+              return ok({ source: "kv_cache", ...(cached as Record<string, unknown>) });
+            }
+          }
+          const bundle = await ctx.loadProjectContext(env.DB, slug, {
+            include_history: args.include_history,
+            limit: args.limit,
+          });
+          const serialized = serializeProjectContext(bundle);
+          if (useCache) {
+            await setCachedProjectContext(env.APP_KV, slug, serialized);
+          }
+          return ok(serialized);
+        }
+
+        const tasks = await ctx.loadContextItems(env.DB, {
           tags: args.tags?.map((tag) => tag.toLowerCase()),
           project_slugs: args.project_slugs?.map((slug) => slug.toLowerCase()),
           group_slugs: args.group_slugs?.map((slug) => slug.toLowerCase()),
@@ -591,7 +662,13 @@ export function registerTools(server: McpServer, env: Env) {
           startup_priority_max: args.startup_priority_max,
           limit: args.limit,
         });
-        return ok({ items: tasks.map(serializeTask), count: tasks.length });
+        return ok(serializeRawMemories({
+          level: "raw_memories",
+          source: "d1",
+          items: tasks,
+          count: tasks.length,
+          generated_at: new Date().toISOString(),
+        }));
       } catch (error: unknown) {
         return err(`Failed to load context: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -600,7 +677,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "update_item",
-    "Update item metadata, tags, due date, recurrence, project/group assignment, or archive state",
+    "Update any field on an existing item (title, description, priority, due date, project, group, tags, lifecycle state, recurrence, etc.). Preferred over creating a new item whenever existing information changes. Always prefer updating over creating duplicates.",
     {
       id: z.number().int().positive(),
       title: z.string().optional(),
@@ -667,6 +744,134 @@ export function registerTools(server: McpServer, env: Env) {
         return ok({ item: serializeTask(task) });
       } catch (error: unknown) {
         return err(`Failed to update item: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "set_item_startup_priority",
+    "Set how important an item is for startup context loading. Scale: 10 = always load (critical), 8 = frequently needed, 5 = topic-specific (loads when relevant topic is active), 2 = historical/background (rarely needed), 0 = never auto-load. Use to control what appears in get_startup_context without loading raw memories.",
+    {
+      id: z.number().int().positive(),
+      startup_priority: z.number().int().min(0).max(10),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const task = await db.updateTask(env.DB, args.id, {
+          startup_priority: args.startup_priority,
+        });
+        if (!task) return err(`Item '${args.id}' not found`);
+        await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
+        return ok({ item: serializeTask(task) });
+      } catch (error: unknown) {
+        return err(`Failed to set startup priority: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "set_item_pinned",
+    "Pin or unpin an item so it appears in focused context loads",
+    {
+      id: z.number().int().positive(),
+      pinned: z.boolean(),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const task = await db.updateTask(env.DB, args.id, { pinned: args.pinned });
+        if (!task) return err(`Item '${args.id}' not found`);
+        await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
+        return ok({ item: serializeTask(task) });
+      } catch (error: unknown) {
+        return err(`Failed to set pinned: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "set_item_lifecycle_state",
+    "Transition an item to active, superseded, archived, completed, stale, or dormant",
+    {
+      id: z.number().int().positive(),
+      lifecycle_state: lifecycleStateSchema,
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const task = await db.updateTask(env.DB, args.id, {
+          lifecycle_state: args.lifecycle_state,
+          archived: args.lifecycle_state === "archived",
+        });
+        if (!task) return err(`Item '${args.id}' not found`);
+        await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
+        return ok({ item: serializeTask(task) });
+      } catch (error: unknown) {
+        return err(`Failed to set lifecycle state: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "set_item_group",
+    "Assign or remove an item from a context group (topic/profile bucket)",
+    {
+      id: z.number().int().positive(),
+      group_slug: z.string().optional(),
+      group_name: z.string().optional(),
+      clear_group: z.boolean().optional(),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const task = await db.updateTask(env.DB, args.id, {
+          group: args.clear_group
+            ? null
+            : args.group_slug || args.group_name
+              ? { slug: args.group_slug, name: args.group_name }
+              : undefined,
+          clear_group: args.clear_group,
+        });
+        if (!task) return err(`Item '${args.id}' not found`);
+        await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
+        return ok({ item: serializeTask(task) });
+      } catch (error: unknown) {
+        return err(`Failed to set group: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "set_item_project",
+    "Assign or remove an item from a project",
+    {
+      id: z.number().int().positive(),
+      project_slug: z.string().optional(),
+      project_name: z.string().optional(),
+      clear_project: z.boolean().optional(),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const task = await db.updateTask(env.DB, args.id, {
+          project: args.clear_project
+            ? null
+            : args.project_slug || args.project_name
+              ? { slug: args.project_slug, name: args.project_name }
+              : undefined,
+          clear_project: args.clear_project,
+        });
+        if (!task) return err(`Item '${args.id}' not found`);
+        await syncVectorForTask(env, task);
+        await invalidateContextCache(env.APP_KV);
+        return ok({ item: serializeTask(task) });
+      } catch (error: unknown) {
+        return err(`Failed to set project: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );
@@ -925,12 +1130,12 @@ export function registerTools(server: McpServer, env: Env) {
         const filter = args.include_obsolete
           ? undefined
           : {
-              lifecycle_state: { $in: defaultStates },
-              entity_type: {
-                $in: args.entity_types ?? ["strategic_goal", "tactical_task", "context_memory"],
-              },
-              archived: false,
-            };
+            lifecycle_state: { $in: defaultStates },
+            entity_type: {
+              $in: args.entity_types ?? ["strategic_goal", "tactical_task", "context_memory"],
+            },
+            archived: false,
+          };
         let matches;
         try {
           matches = await semanticSearchTaskIds(env, args.query, args.limit ?? 10, filter);
@@ -1146,6 +1351,53 @@ export function registerTools(server: McpServer, env: Env) {
   );
 
   server.tool(
+    "update_group_metadata",
+    "Update a context group's deterministic retrieval metadata: kind, priority, description, and summary mode",
+    {
+      slug: z.string().min(1),
+      group_kind: z.enum(["topic", "profile", "project", "system"]).optional(),
+      retrieval_priority: z.number().int().min(0).max(100).optional(),
+      description: z.string().optional(),
+      summary_mode: z.enum(["auto", "manual"]).optional(),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const group = await db.updateGroupMetadata(env.DB, args.slug.toLowerCase(), {
+          group_kind: args.group_kind,
+          retrieval_priority: args.retrieval_priority,
+          description: args.description,
+          summary_mode: args.summary_mode,
+        });
+        if (!group) return err(`Group '${args.slug}' not found`);
+        await invalidateContextCache(env.APP_KV);
+        return ok({ group });
+      } catch (error: unknown) {
+        return err(`Failed to update group metadata: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
+    "set_group_canonical_item",
+    "Set the canonical active item that represents the current state of a topic/group. Pass null to clear.",
+    {
+      group_slug: z.string().min(1),
+      item_id: z.number().int().positive().nullable(),
+    },
+    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    async (args) => {
+      try {
+        const group = await db.setGroupCanonicalItem(env.DB, args.group_slug.toLowerCase(), args.item_id);
+        await invalidateContextCache(env.APP_KV, [args.group_slug.toLowerCase()]);
+        return ok({ group });
+      } catch (error: unknown) {
+        return err(`Failed to set group canonical item: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  server.tool(
     "delete_group",
     "Delete a group by slug",
     { slug: z.string().min(1) },
@@ -1167,7 +1419,7 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "get_context_summary",
-    "Return a deterministic rollup summary of current context for a topic or project",
+    "Return the canonical current state and deterministic summary for a topic (group or tag slug).",
     {
       scope: z.string().min(1).optional().describe("Topic or project slug (e.g. work, health, my-project)"),
       topic: z.string().optional().describe("Alias for scope; lowercased tag/topic slug"),
@@ -1190,20 +1442,12 @@ export function registerTools(server: McpServer, env: Env) {
           }
         }
 
-        const projectSlug = args.project_slug?.toLowerCase();
-        const items = await db.loadContextItems(env.DB, {
-          tags: [effectiveScope],
-          project_slugs: projectSlug ? [projectSlug] : undefined,
-          current_only: true,
-          include_history: false,
-          limit: 50,
-        });
-
-        const summary = db.buildContextSummary(effectiveScope, items);
+        const bundle = await ctx.loadTopicSummary(env.DB, effectiveScope);
+        const serialized = serializeTopicSummary(bundle);
         if (useCache) {
-          await setCachedContextSummary(env.APP_KV, effectiveScope, summary);
+          await setCachedContextSummary(env.APP_KV, effectiveScope, serialized);
         }
-        return ok({ scope: effectiveScope, source: "d1", summary });
+        return ok(serialized);
       } catch (error: unknown) {
         return err(`Failed to get context summary: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1212,24 +1456,13 @@ export function registerTools(server: McpServer, env: Env) {
 
   server.tool(
     "get_startup_context",
-    "Return a bundled conversation startup loadout: always-load items, profile context, current focus, active objectives, active projects, pinned context, recent summaries, and optional historical background",
+    "Return an extremely lightweight startup context: profile, active goals, current focus, active projects, always-load items, and topic summaries.",
     {
-      topics: z.array(z.string()).optional().describe("Topic/project slugs to include in recent summaries"),
-      mode: z.enum(["minimal", "normal", "full"]).optional().default("normal").describe("Amount of context to load"),
-      include_always_load: z.boolean().optional().describe("Override mode default for always_load section"),
-      include_profile: z.boolean().optional().describe("Override mode default for profile_context section"),
-      include_focus: z.boolean().optional().describe("Override mode default for current_focus section"),
-      include_objectives: z.boolean().optional().describe("Override mode default for active_objectives section"),
-      include_projects: z.boolean().optional().describe("Override mode default for active_projects section"),
-      include_pinned: z.boolean().optional().describe("Override mode default for pinned_context section"),
-      include_summaries: z.boolean().optional().describe("Override mode default for recent_summaries section"),
-      include_history: z.boolean().optional().describe("Override mode default for historical_background section"),
       use_cache: z.boolean().optional().default(true),
     },
     { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
     async (args) => {
       try {
-        const mode = args.mode ?? "normal";
         const useCache = args.use_cache ?? true;
         if (useCache) {
           const cached = await getCachedStartupContext(env.APP_KV);
@@ -1238,128 +1471,12 @@ export function registerTools(server: McpServer, env: Env) {
           }
         }
 
-        const defaults = modeDefaults(mode);
-        const sections: SectionDefaults = {
-          always_load: args.include_always_load ?? defaults.always_load,
-          profile: args.include_profile ?? defaults.profile,
-          focus: args.include_focus ?? defaults.focus,
-          objectives: args.include_objectives ?? defaults.objectives,
-          projects: args.include_projects ?? defaults.projects,
-          pinned: args.include_pinned ?? defaults.pinned,
-          summaries: args.include_summaries ?? defaults.summaries,
-          history: args.include_history ?? defaults.history,
-        };
-
-        const relevantThreshold = mode === "minimal" ? 10 : 7;
-
-        const [alwaysLoadItems, profileItems, activeObjectives, active_projects, pinnedItems] = await Promise.all([
-          sections.always_load
-            ? db.loadContextItems(env.DB, { startup_priority_min: 10, current_only: true, include_history: false, limit: 20 })
-            : Promise.resolve([] as db.EnrichedTask[]),
-          sections.profile
-            ? db.loadProfileItems(env.DB, { startup_priority_min: relevantThreshold, limit: 20 })
-            : Promise.resolve([] as db.EnrichedTask[]),
-          sections.objectives
-            ? db.loadActiveObjectives(env.DB, { limit: 20, startupPriorityMin: relevantThreshold })
-            : Promise.resolve([] as db.EnrichedTask[]),
-          sections.projects
-            ? db.loadActiveProjects(env.DB, 20)
-            : Promise.resolve([] as db.Project[]),
-          sections.pinned
-            ? db.loadPinnedItems(env.DB, { startup_priority_min: relevantThreshold, limit: 20 })
-            : Promise.resolve([] as db.EnrichedTask[]),
-        ]);
-
-        const always_load = db.dedupeTasksById(alwaysLoadItems);
-        const alwaysLoadIds = new Set(always_load.map((item) => item.id));
-
-        const profile_context = db.dedupeTasksById(profileItems).filter(
-          (item) => !alwaysLoadIds.has(item.id)
-        );
-        const profileIds = new Set(profile_context.map((item) => item.id));
-
-        const active_objectives = db.dedupeTasksById(activeObjectives).filter(
-          (item) => !alwaysLoadIds.has(item.id) && !profileIds.has(item.id)
-        );
-        const objectiveIds = new Set(active_objectives.map((item) => item.id));
-
-        const pinned_context = db.dedupeTasksById(pinnedItems).filter(
-          (item) => !alwaysLoadIds.has(item.id) && !profileIds.has(item.id) && !objectiveIds.has(item.id)
-        );
-
-        const current_focus = sections.focus
-          ? serializeFocusContext(await db.getFocusContext(env.DB))
-          : null;
-
-        const topics = args.topics ?? [];
-        const recent_summaries = sections.summaries
-          ? await Promise.all(
-              topics.map(async (topic) => {
-                const scope = topic.toLowerCase();
-                const items = db.dedupeTasksById(
-                  await db.loadContextItems(env.DB, {
-                    tags: [scope],
-                    startup_priority_min: relevantThreshold,
-                    current_only: true,
-                    include_history: false,
-                    limit: 50,
-                  })
-                );
-                return { scope, summary: db.buildContextSummary(scope, items) };
-              })
-            )
-          : [];
-
-        const seenForHistory = new Set([
-          ...alwaysLoadIds,
-          ...profileIds,
-          ...objectiveIds,
-          ...pinned_context.map((item) => item.id),
-        ]);
-        const historical_background = sections.history
-          ? db.dedupeTasksById(
-              await db.loadContextItems(env.DB, {
-                startup_priority_min: 3,
-                startup_priority_max: 3,
-                include_history: true,
-                limit: 20,
-              })
-            ).filter((item) => !seenForHistory.has(item.id))
-          : [];
-
-        const allStartupItems = [
-          ...always_load,
-          ...profile_context,
-          ...active_objectives,
-          ...pinned_context,
-          ...historical_background,
-        ];
-        const superseding = await db.getSupersedingRelationships(
-          env.DB,
-          allStartupItems.map((item) => item.id)
-        );
-
-        const generated_at = new Date().toISOString();
-        const bundle = {
-          mode,
-          always_load: serializeTasksWithHistory(always_load, superseding),
-          profile_context: serializeTasksWithHistory(profile_context, superseding),
-          active_objectives: serializeTasksWithHistory(active_objectives, superseding),
-          active_projects,
-          pinned_context: serializeTasksWithHistory(pinned_context, superseding),
-          current_focus,
-          historical_background: serializeTasksWithHistory(historical_background, superseding),
-          recent_summaries,
-          context_version: db.computeContextVersion(allStartupItems),
-          last_consolidated: db.computeLastConsolidated(profile_context),
-          generated_at,
-        };
-
+        const bundle = await ctx.loadStartupContext(env.DB);
+        const serialized = serializeStartupContext(bundle);
         if (useCache) {
-          await setCachedStartupContext(env.APP_KV, bundle);
+          await setCachedStartupContext(env.APP_KV, serialized);
         }
-
-        return ok({ source: "d1", ...bundle });
+        return ok(serialized);
       } catch (error: unknown) {
         return err(`Failed to get startup context: ${error instanceof Error ? error.message : String(error)}`);
       }

@@ -9,15 +9,16 @@ A Cloudflare Worker that exposes a **Model Context Protocol (MCP)** server for l
 
 ## What it does
 
-`mcp-todo` stores tasks, memories, projects, objectives, and relationships in **D1**, caches hot context in **KV**, and indexes task text in **Vectorize** for semantic search. The worker exposes a set of MCP tools that an AI agent can call to:
+`mcp-todo` is a deterministic AI memory system. It stores tasks, memories, projects, objectives, and relationships in **D1**, caches hot context in **KV**, and indexes task text in **Vectorize** for semantic search. The worker exposes a small set of MCP tools that an AI agent can call to:
 
-- Capture tasks and memories with tags, projects, priorities, and lifecycle states.
+- Capture tasks and memories with tags, projects, groups, priorities, and lifecycle states.
 - Query and mutate state deterministically.
 - Retrieve focused startup context on every new conversation.
+- Progressively load topic summaries, project context, and raw memories only when needed.
 - Search semantically across stored items.
 - Discover and consolidate duplicate or superseded memories.
 
-All retrieval ranking is deterministic (priority + recency); AI is used only for enhancement (embeddings for semantic search, suggested relationships, summaries).
+**Design principle:** the database decides what to return; the AI only decides what it wants to know next. Retrieval is deterministic. AI is used only for enhancement (embeddings for semantic search, suggested relationships, summaries).
 
 ---
 
@@ -36,6 +37,25 @@ Configure them in `wrangler.jsonc`.
 
 ## Core concepts
 
+### Context hierarchy
+
+Retrieval is organized into layers. An AI should move down the hierarchy only when more detail is required:
+
+```
+Startup Context
+    ↓
+Topic Summary
+    ↓
+Project Context
+    ↓
+Raw Memories
+```
+
+- **Startup Context** — extremely lightweight: profile, active goals, current focus, active projects, always-load items, and topic summaries.
+- **Topic Summary** — the single canonical active item for a topic/group plus a deterministic rollup.
+- **Project Context** — project, active objective, active items, recurring systems, and optional history.
+- **Raw Memories** — individual items, filtered deterministically by tags, groups, projects, lifecycle state, and startup priority.
+
 ### Items
 
 The central table is `todos`. An item can be:
@@ -43,9 +63,19 @@ The central table is `todos`. An item can be:
 - **`item_kind`**: `task` or `memory`
 - **`entity_type`**: `tactical_task`, `strategic_goal`, `recurring_system`, `context_memory`, `archived_history`
 - **`lifecycle_state`**: `active`, `dormant`, `stale`, `superseded`, `archived`, `completed`
-- **`startup_priority`**: `1` (low) to `3` (high) — controls how eagerly an item appears in startup context.
+- **`startup_priority`**: `0` (never load at startup) to `10` (always load). Manual assignment only.
 
-Items can be pinned, profiled, always-loaded, tagged, assigned to projects/groups, and linked to objectives.
+Items can be pinned, tagged, assigned to projects/groups, and linked to objectives.
+
+### Context groups
+
+Groups are deterministic retrieval buckets. Every group has:
+
+- **`group_kind`**: `topic`, `profile`, `project`, or `system`
+- **`retrieval_priority`**: controls whether the group is included in startup topic summaries
+- **`canonical_item_id`**: the single active item that represents the current state of the topic
+
+Tags remain for organization and search; groups define deterministic retrieval behavior.
 
 ### Projects and objectives
 
@@ -62,6 +92,18 @@ Items can be pinned, profiled, always-loaded, tagged, assigned to projects/group
 - `blocks`, `depends_on`, `supports` — dependency tracking
 
 These power history-aware retrieval and the consolidation workflow.
+
+### Startup priority philosophy
+
+Priorities are assigned manually, never calculated:
+
+| Priority | Meaning |
+|----------|---------|
+| 10 | Always load during startup |
+| 8 | Usually load |
+| 5 | Topic-specific |
+| 2 | Historical |
+| 0 | Never load during startup |
 
 ---
 
@@ -103,8 +145,13 @@ These power history-aware retrieval and the consolidation workflow.
 
 ### Context retrieval
 
-- `get_startup_context` — primary conversation bootstrap tool.
-- `get_context_summary` — lightweight deterministic summary for a scope/topic.
+- `load_context` — **one flexible retrieval interface** for the whole hierarchy.
+  - `level: "startup"` — lightweight startup bundle.
+  - `level: "topic_summary"` — canonical item + deterministic summary for a topic.
+  - `level: "project"` — project, objective, active items, recurring systems, optional history.
+  - `level: "raw_memories"` — filtered raw items (default, backward-compatible).
+- `get_startup_context` — convenience alias for `load_context({ level: "startup" })`.
+- `get_context_summary` — convenience alias for `load_context({ level: "topic_summary" })`.
 - `get_focus_context` — current strategic focus.
 - `get_active_objectives`, `get_active_projects`
 
@@ -115,75 +162,85 @@ These power history-aware retrieval and the consolidation workflow.
 
 ---
 
-## Tiered startup context (`get_startup_context`)
+## Startup context (`load_context` / `get_startup_context`)
 
 The main entry point for an AI agent bootstrapping a new conversation.
 
-### Modes
+Startup context is intentionally minimal. It answers:
 
-| Mode      | Loads by default | Threshold | Notes |
-|-----------|------------------|-----------|-------|
-| `minimal` | always_load, profile, focus, projects, pinned | `startup_priority >= 10` | Omit objectives, summaries, history |
-| `normal`  | all sections above + objectives + summaries | `startup_priority >= 7` | Default mode |
-| `full`    | normal + historical background | `startup_priority >= 7` for current, `>= 3` for history |
+- Who is this user?
+- What are they currently doing?
+- What are their active goals?
+- What projects are active?
+- What topics matter?
 
-### Explicit overrides
-
-Every section can be forced on/off independently:
-
-- `include_always_load`
-- `include_profile`
-- `include_focus`
-- `include_objectives`
-- `include_projects`
-- `include_pinned`
-- `include_summaries`
-- `include_history`
-
-Overrides take precedence over mode defaults.
+It does **not** load every pinned memory.
 
 ### Returned bundle
 
 ```jsonc
 {
-  "mode": "normal",
+  "level": "startup",
   "source": "d1" | "kv_cache",
-  "current_focus": { /* active objective/project/focus */ },
-  "always_load": [ /* pinned/always-load items */ ],
-  "profile_context": [ /* profile items */ ],
-  "active_objectives": [ /* strategic goals */ ],
-  "active_projects": [ /* projects with active work */ ],
-  "pinned_context": [ /* pinned items */ ],
-  "recent_summaries": [ /* lightweight summaries for requested topics */ ],
-  "historical_background": [ /* superseded/archived items, full mode or include_history only */ ],
   "context_version": 123,
+  "generated_at": "2026-07-01T...",
   "last_consolidated": "2026-07-01T...",
-  "generated_at": "2026-07-01T..."
+  "profile": { /* single current profile item */ },
+  "active_goals": [ /* active strategic goals */ ],
+  "current_focus": { /* project + objective + next tactical step */ },
+  "active_projects": [ /* projects with active work */ ],
+  "always_load": [ /* items with startup_priority = 10 */ ],
+  "topic_summaries": [ /* canonical items for high-priority groups */ ]
 }
 ```
 
-The bundle is cached in KV under `context:startup` and invalidated on writes.
+The bundle is cached in KV under `context:startup` and invalidated on writes. The `context_version` changes only when underlying items change, so AI agents can reuse a cached bundle when the version matches.
 
 ---
 
-## Lightweight summaries (`get_context_summary`)
+## Topic summaries (`load_context` with `level: "topic_summary"`)
 
 Deterministic rollup for a scope/topic, cached in KV under `context:summary:<scope>`.
 
 ```jsonc
 {
-  "scope": "work",
-  "total": 12,
-  "active_count": 5,
-  "pinned_count": 2,
-  "top_item": { "id": 42, "title": "Top priority item" },
-  "version": 7,
-  "last_consolidated": "2026-07-01T...",
+  "level": "topic_summary",
+  "scope": "aws",
+  "group": { "slug": "aws", "group_kind": "topic", "retrieval_priority": 8 },
+  "canonical_item": { /* single current active representation */ },
+  "summary": {
+    "scope": "aws",
+    "total": 12,
+    "active_count": 5,
+    "pinned_count": 2,
+    "top_item": { "id": 42, "title": "Current AWS strategy" },
+    "version": 7,
+    "last_consolidated": "2026-07-01T...",
+    "generated_at": "2026-07-01T..."
+  },
+  "source": "d1",
   "generated_at": "2026-07-01T..."
 }
 ```
 
-Summaries are deliberately small: counts, one high-priority top item, and versioning metadata. No verbose bucket breakdowns.
+If no `canonical_item_id` is set on the group, the highest-priority active item in that group/tag is returned as the de-facto canonical. Use `set_group_canonical_item` to assign the canonical item explicitly.
+
+## Project context (`load_context` with `level: "project"`)
+
+Loads a project, its active objective, active work, recurring systems, and optional history.
+
+```jsonc
+{
+  "level": "project",
+  "source": "d1",
+  "project": { /* project record */ },
+  "active_objective": { /* current strategic goal */ },
+  "active_items": [ /* active project items */ ],
+  "recurring_systems": [ /* recurring support items */ ],
+  "history": [ /* superseded/archived/completed, only if include_history=true */ ],
+  "generated_at": "2026-07-01T..."
+}
+```
 
 ---
 
@@ -252,9 +309,11 @@ The MCP server is available at `http://localhost:8787/mcp`.
 ## Important implementation notes
 
 - **D1 is the source of truth.** Vectorize and KV are caches/indexes; failures there are caught and do not block D1 writes.
-- **Deterministic ranking:** startup and summary retrieval order by `startup_priority` DESC, then recency. No LLM is involved in ranking.
-- **Superseded/historical items** are available in startup context only when explicitly requested (`full` mode or `include_history=true`).
-- **Context invalidation:** writes clear the active focus cache and invalidate startup/summary caches as appropriate.
+- **Deterministic retrieval:** the database decides what to return. Ranking uses explicit metadata (`startup_priority`, `retrieval_priority`, `lifecycle_state`, `pinned`, recency). No LLM is involved in retrieval.
+- **Canonical current state:** every topic can have one canonical active item. Older versions remain stored via `supersedes`/`replaces`/`derived_from` relationships, but normal retrieval returns only the active version.
+- **Superseded/historical items** are returned only when `include_history=true`.
+- **Context invalidation:** writes clear the active focus cache and invalidate startup/topic/project caches as appropriate.
+- **AI is optional:** it only enhances organization (summaries, embeddings, consolidation suggestions); it never controls correctness or retrieval ordering.
 
 ---
 

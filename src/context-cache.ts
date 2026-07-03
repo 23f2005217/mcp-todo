@@ -1,5 +1,6 @@
 const CONTEXT_SUMMARY_PREFIX = "context:summary:";
 const STARTUP_KEY = "context:startup";
+const PROJECT_CONTEXT_PREFIX = "context:project:";
 
 const DEFAULT_SUMMARY_TTL_SECONDS = 300;
 const DEFAULT_STARTUP_TTL_SECONDS = 60;
@@ -45,14 +46,44 @@ export async function setCachedStartupContext(
   await kv.put(STARTUP_KEY, JSON.stringify(bundle), putOptions(ttlSeconds ?? DEFAULT_STARTUP_TTL_SECONDS));
 }
 
+function projectKey(slug: string): string {
+  return `${PROJECT_CONTEXT_PREFIX}${slug.toLowerCase()}`;
+}
+
+export async function getCachedProjectContext(
+  kv: KVNamespace,
+  slug: string
+): Promise<unknown | null> {
+  return kv.get<unknown>(projectKey(slug), "json");
+}
+
+export async function setCachedProjectContext(
+  kv: KVNamespace,
+  slug: string,
+  bundle: unknown,
+  ttlSeconds?: number
+): Promise<void> {
+  await kv.put(
+    projectKey(slug),
+    JSON.stringify(bundle),
+    putOptions(ttlSeconds ?? DEFAULT_SUMMARY_TTL_SECONDS)
+  );
+}
+
 export async function invalidateContextCache(
   kv: KVNamespace,
-  scopes?: string[]
+  scopes?: string[],
+  projectSlugs?: string[]
 ): Promise<void> {
   const keys: string[] = [STARTUP_KEY];
   if (scopes) {
     for (const scope of scopes) {
       keys.push(summaryKey(scope));
+    }
+  }
+  if (projectSlugs) {
+    for (const slug of projectSlugs) {
+      keys.push(projectKey(slug));
     }
   }
   await Promise.all(keys.map((key) => kv.delete(key)));

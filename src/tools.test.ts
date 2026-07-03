@@ -162,7 +162,7 @@ describe("get_context_summary tool", () => {
     assert.deepStrictEqual(data.summary, { total: 42 });
   });
 
-  it("builds deterministic summary from D1 and writes KV cache", async () => {
+  it("builds deterministic topic summary from D1 and writes KV cache", async () => {
     const { server, tools } = createMockServer();
     const { db, queries } = createMockDb();
     const { kv, stored } = createMockKv();
@@ -172,6 +172,7 @@ describe("get_context_summary tool", () => {
     const data = resultData(result) as Record<string, unknown>;
     assert.strictEqual(data.scope, "health");
     assert.strictEqual(data.source, "d1");
+    assert.strictEqual(data.level, "topic_summary");
     const summary = data.summary as Record<string, unknown>;
     assert.strictEqual(summary.total, 0);
     assert.strictEqual(summary.scope, "health");
@@ -182,7 +183,7 @@ describe("get_context_summary tool", () => {
 
     const cached = stored.get("context:summary:health");
     assert.ok(cached);
-    assert.strictEqual(JSON.parse(cached.value).total, 0);
+    assert.strictEqual(JSON.parse(cached.value).level, "topic_summary");
   });
 
   it("uses topic as scope alias when scope is omitted", async () => {
@@ -211,20 +212,6 @@ describe("get_context_summary tool", () => {
     assert.ok(loadQuery?.params.includes("my-project"));
   });
 
-  it("adds project_slugs filter when project_slug is provided", async () => {
-    const { server, tools } = createMockServer();
-    const { db, queries } = createMockDb();
-    const { kv } = createMockKv();
-    registerTools(server, { DB: db, APP_KV: kv } as Env);
-
-    await invokeTool(tools, "get_context_summary", { scope: "work", project_slug: "acme" });
-    const loadQuery = queries.find((q) => q.sql.includes("FROM todos t"));
-    assert.ok(loadQuery);
-    assert.ok(loadQuery.params.includes("work"));
-    assert.ok(loadQuery.params.includes("acme"));
-    assert.ok(loadQuery.sql.includes("projects WHERE slug"));
-  });
-
   it("skips cache when use_cache is false", async () => {
     const { server, tools } = createMockServer();
     const { db } = createMockDb();
@@ -234,6 +221,7 @@ describe("get_context_summary tool", () => {
     const result = await invokeTool(tools, "get_context_summary", { scope: "work", use_cache: false });
     const data = resultData(result) as Record<string, unknown>;
     assert.strictEqual(data.source, "d1");
+    assert.strictEqual(data.level, "topic_summary");
     assert.strictEqual((data.summary as Record<string, unknown>).total, 0);
     // With use_cache=false the existing cached value is left untouched; only behavior verified above.
   });
@@ -274,7 +262,7 @@ describe("get_startup_context tool", () => {
     assert.deepStrictEqual(data.active_projects, [{ slug: "cached" }]);
   });
 
-  it("builds bundle from D1 helpers and caches it", async () => {
+  it("builds lightweight startup bundle from D1 and caches it", async () => {
     const { server, tools } = createMockServer();
     const { db, queries } = createMockDb();
     const { kv, stored } = createMockKv();
@@ -283,66 +271,25 @@ describe("get_startup_context tool", () => {
     const result = await invokeTool(tools, "get_startup_context", {});
     const data = resultData(result) as Record<string, unknown>;
     assert.strictEqual(data.source, "d1");
-    assert.strictEqual(data.mode, "normal");
+    assert.strictEqual(data.level, "startup");
     assert.ok(data.current_focus && typeof data.current_focus === "object");
     assert.ok(Array.isArray(data.always_load));
-    assert.ok(Array.isArray(data.profile_context));
-    assert.ok(Array.isArray(data.active_objectives));
+    assert.ok("profile" in data);
+    assert.ok(Array.isArray(data.active_goals));
     assert.ok(Array.isArray(data.active_projects));
-    assert.ok(Array.isArray(data.pinned_context));
-    assert.ok(Array.isArray(data.historical_background));
-    assert.ok(Array.isArray(data.recent_summaries));
+    assert.ok(Array.isArray(data.topic_summaries));
     assert.ok(typeof data.context_version === "number");
-    assert.ok(typeof data.last_consolidated === "object");
     assert.ok(typeof data.generated_at === "string");
 
     const projectQuery = queries.find((q) => q.sql.includes("FROM projects p") && q.sql.includes("EXISTS"));
     assert.ok(projectQuery);
-    assert.strictEqual(projectQuery.params.at(-1), 20);
+    assert.strictEqual(projectQuery.params.at(-1), 10);
 
     const cached = stored.get("context:startup");
     assert.ok(cached);
     const cachedBundle = JSON.parse(cached.value) as Record<string, unknown>;
     assert.ok(Array.isArray(cachedBundle.always_load));
     assert.strictEqual(cachedBundle.generated_at, data.generated_at);
-  });
-
-  it("queries historical background when include_history is true", async () => {
-    const { server, tools } = createMockServer();
-    const { db, queries } = createMockDb();
-    const { kv } = createMockKv();
-    registerTools(server, { DB: db, APP_KV: kv } as Env);
-
-    await invokeTool(tools, "get_startup_context", { include_history: true });
-    const historicalQuery = queries.find(
-      (q) =>
-        q.sql.includes("t.startup_priority >= ?") &&
-        q.sql.includes("t.startup_priority <= ?") &&
-        q.params.includes(3)
-    );
-    assert.ok(historicalQuery);
-  });
-
-  it("generates recent summaries for provided topics", async () => {
-    const { server, tools } = createMockServer();
-    const { db, queries } = createMockDb();
-    const { kv } = createMockKv();
-    registerTools(server, { DB: db, APP_KV: kv } as Env);
-
-    const result = await invokeTool(tools, "get_startup_context", { topics: ["Work", "Health"] });
-    const data = resultData(result) as Record<string, unknown>;
-    const summaries = data.recent_summaries as Array<{ scope: string; summary: Record<string, unknown> }>;
-    assert.strictEqual(summaries.length, 2);
-    assert.strictEqual(summaries[0].scope, "work");
-    assert.strictEqual(summaries[1].scope, "health");
-    assert.strictEqual(summaries[0].summary.total, 0);
-
-    const topicQueries = queries.filter(
-      (q) => q.sql.includes("FROM todos t") && (q.params.includes("work") || q.params.includes("health"))
-    );
-    assert.strictEqual(topicQueries.length, 2);
-    assert.ok(topicQueries.some((q) => q.params.includes("work")));
-    assert.ok(topicQueries.some((q) => q.params.includes("health")));
   });
 
   it("skips cache when use_cache is false", async () => {
@@ -354,31 +301,8 @@ describe("get_startup_context tool", () => {
     const result = await invokeTool(tools, "get_startup_context", { use_cache: false });
     const data = resultData(result) as Record<string, unknown>;
     assert.strictEqual(data.source, "d1");
+    assert.strictEqual(data.level, "startup");
     // With use_cache=false the existing cached value is left untouched; only behavior verified above.
-  });
-
-  it("minimal mode omits objectives, summaries, and history by default", async () => {
-    const { server, tools } = createMockServer();
-    const { db, queries } = createMockDb();
-    const { kv } = createMockKv();
-    registerTools(server, { DB: db, APP_KV: kv } as Env);
-
-    const result = await invokeTool(tools, "get_startup_context", { mode: "minimal", topics: ["Work"] });
-    const data = resultData(result) as Record<string, unknown>;
-    assert.strictEqual(data.mode, "minimal");
-    assert.ok(data.current_focus && typeof data.current_focus === "object");
-    assert.deepStrictEqual(data.active_objectives, []);
-    assert.deepStrictEqual(data.recent_summaries, []);
-    assert.deepStrictEqual(data.historical_background, []);
-    assert.ok(Array.isArray(data.always_load));
-    assert.ok(Array.isArray(data.profile_context));
-    assert.ok(Array.isArray(data.active_projects));
-    assert.ok(Array.isArray(data.pinned_context));
-
-    const objectiveQuery = queries.find(
-      (q) => q.sql.includes("entity_type IN (?)") && q.params.includes("strategic_goal")
-    );
-    assert.ok(!objectiveQuery);
   });
 });
 

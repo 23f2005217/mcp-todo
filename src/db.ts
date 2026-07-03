@@ -57,11 +57,17 @@ export interface Project {
   focus_updated_at: string | null;
 }
 
+export type GroupKind = "topic" | "profile" | "project" | "system";
+
 export interface Group {
   id: number;
   name: string;
   slug: string;
   description: string | null;
+  group_kind: GroupKind;
+  retrieval_priority: number;
+  canonical_item_id: number | null;
+  summary_mode: string;
 }
 
 export interface Tag {
@@ -93,6 +99,7 @@ export interface ItemListQuery {
   project_slugs?: string[];
   group_slugs?: string[];
   tags?: string[];
+  group_kinds?: GroupKind[];
   stale_only?: boolean;
   limit?: number;
   offset?: number;
@@ -224,7 +231,7 @@ async function ensureEntity(
       .prepare(
         table === "projects"
           ? "SELECT id, name, slug, description, active_objective_id, focus_version, focus_updated_at FROM projects WHERE slug = ?"
-          : "SELECT id, name, slug, description FROM groups WHERE slug = ?"
+          : "SELECT id, name, slug, description, group_kind, retrieval_priority, canonical_item_id, summary_mode FROM groups WHERE slug = ?"
       )
     .bind(slug)
     .first();
@@ -248,10 +255,110 @@ export async function listProjects(db: D1Database): Promise<Project[]> {
 export async function listGroups(db: D1Database): Promise<Group[]> {
   return rows<Group>(
     await db
-      .prepare("SELECT id, name, slug, description FROM groups ORDER BY name ASC")
+      .prepare("SELECT id, name, slug, description, group_kind, retrieval_priority, canonical_item_id, summary_mode FROM groups ORDER BY name ASC")
       .all()
       .then((result) => result.results as Record<string, unknown>[])
   );
+}
+
+export async function getGroupBySlug(db: D1Database, slug: string): Promise<Group | null> {
+  return row<Group>(
+    await db
+      .prepare("SELECT id, name, slug, description, group_kind, retrieval_priority, canonical_item_id, summary_mode FROM groups WHERE slug = ?")
+      .bind(slug.toLowerCase())
+      .first()
+  );
+}
+
+export async function listContextGroups(
+  db: D1Database,
+  options: { kinds?: GroupKind[]; minRetrievalPriority?: number; hasCanonicalOnly?: boolean; limit?: number } = {}
+): Promise<Group[]> {
+  const where: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.kinds && options.kinds.length > 0) {
+    where.push(`group_kind IN (${options.kinds.map(() => "?").join(", ")})`);
+    params.push(...options.kinds);
+  }
+  if (typeof options.minRetrievalPriority === "number") {
+    where.push("retrieval_priority >= ?");
+    params.push(Math.trunc(options.minRetrievalPriority));
+  }
+  if (options.hasCanonicalOnly) {
+    where.push("canonical_item_id IS NOT NULL");
+  }
+
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
+  params.push(limit);
+
+  return rows<Group>(
+    await db
+      .prepare(`SELECT id, name, slug, description, group_kind, retrieval_priority, canonical_item_id, summary_mode FROM groups ${whereClause} ORDER BY retrieval_priority DESC, name ASC LIMIT ?`)
+      .bind(...params)
+      .all()
+      .then((result) => result.results as Record<string, unknown>[])
+  );
+}
+
+export async function setGroupCanonicalItem(
+  db: D1Database,
+  groupSlug: string,
+  itemId: number | null
+): Promise<Group> {
+  const group = await getGroupBySlug(db, groupSlug);
+  if (!group) throw new Error(`Group '${groupSlug}' not found`);
+
+  if (itemId !== null) {
+    const item = await getTaskById(db, itemId);
+    if (!item) throw new Error(`Item '${itemId}' not found`);
+  }
+
+  await db
+    .prepare("UPDATE groups SET canonical_item_id = ? WHERE id = ?")
+    .bind(itemId, group.id)
+    .run();
+
+  const refreshed = await getGroupBySlug(db, groupSlug);
+  if (!refreshed) throw new Error(`Group '${groupSlug}' disappeared after update`);
+  return refreshed;
+}
+
+export async function updateGroupMetadata(
+  db: D1Database,
+  slug: string,
+  changes: { group_kind?: GroupKind; retrieval_priority?: number; description?: string | null; summary_mode?: string }
+): Promise<Group | null> {
+  const group = await getGroupBySlug(db, slug);
+  if (!group) return null;
+
+  const sets: string[] = [];
+  const params: unknown[] = [];
+
+  if (changes.group_kind !== undefined) {
+    sets.push("group_kind = ?");
+    params.push(changes.group_kind);
+  }
+  if (changes.retrieval_priority !== undefined) {
+    sets.push("retrieval_priority = ?");
+    params.push(Math.trunc(changes.retrieval_priority));
+  }
+  if (changes.description !== undefined) {
+    sets.push("description = ?");
+    params.push(changes.description);
+  }
+  if (changes.summary_mode !== undefined) {
+    sets.push("summary_mode = ?");
+    params.push(changes.summary_mode);
+  }
+
+  if (sets.length > 0) {
+    params.push(group.id);
+    await db.prepare(`UPDATE groups SET ${sets.join(", ")} WHERE id = ?`).bind(...params).run();
+  }
+
+  return getGroupBySlug(db, slug);
 }
 
 export async function upsertProject(
@@ -1560,5 +1667,4 @@ export {
   loadPinnedItems,
   loadProfileItems,
   loadActiveObjectives,
-  loadActiveProjects,
 } from "./context.js";
