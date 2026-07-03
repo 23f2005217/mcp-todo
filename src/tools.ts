@@ -314,45 +314,58 @@ async function syncVectorForTask(env: Env, task: db.EnrichedTask) {
 }
 
 export function registerTools(server: McpServer, env: Env) {
-  server.tool(
+  server.registerTool(
     "get_app_settings",
-    "Read current app defaults (capture kind, priority, snooze hours, upcoming days). Use to understand defaults before creating items or to check current configuration.",
-    {},
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    {
+      description: "Read current app defaults (capture kind, priority, snooze hours, upcoming days). Use to understand defaults before creating items or to check current configuration.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async () => ok(await getAppSettings(env.APP_KV))
+  
   );
 
-  server.tool(
+  server.registerTool(
     "update_app_settings",
-    "Change app-wide defaults (capture kind, priority, snooze hours, upcoming days). Use when the user wants to change default behavior for future captures or snoozes.",
     {
+      description: "Change app-wide defaults (capture kind, priority, snooze hours, upcoming days). Use when the user wants to change default behavior for future captures or snoozes.",
+      inputSchema: {
       default_quick_add_priority: prioritySchema.optional(),
       default_capture_kind: itemKindSchema.optional(),
       default_upcoming_days: z.number().int().min(1).max(365).optional(),
       default_snooze_hours: z.number().int().min(1).max(24 * 30).optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       const settings = await updateAppSettings(env.APP_KV, args);
       await invalidateContextCache(env.APP_KV);
       return ok(settings);
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "parse_due_date",
-    "Parse a human due date string (e.g. 'tomorrow', 'next friday', 'in 3 days') into an ISO timestamp. Use when you need to validate or preview what a due date resolves to before creating or updating an item.",
     {
+      description: "Parse a human due date string (e.g. 'tomorrow', 'next friday', 'in 3 days') into an ISO timestamp. Use when you need to validate or preview what a due date resolves to before creating or updating an item.",
+      inputSchema: {
       input: z.string().min(1),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => ok(parseDueDate(args.input))
+  
   );
 
-  server.tool(
+  server.registerTool(
     "create_item",
-    "Create a new task or memory with full metadata (title, description, priority, due date, project, group, tags, recurrence, startup priority). Prefer quick_capture for simple inputs. Always run find_semantic_conflicts first to avoid duplicates.",
     {
+      description: "Create a new task or memory with full metadata (title, description, priority, due date, project, group, tags, recurrence, startup priority). Prefer quick_capture for simple inputs. Always run find_semantic_conflicts first to avoid duplicates.",
+      inputSchema: {
       title: z.string().min(1),
       description: z.string().optional(),
       raw_input: z.string().optional(),
@@ -373,7 +386,9 @@ export function registerTools(server: McpServer, env: Env) {
       recurrence_interval: z.number().int().min(1).max(365).optional(),
       recurrence_until: z.string().optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const settings = await getAppSettings(env.APP_KV);
@@ -410,19 +425,23 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to create item: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "quick_capture",
-    "Fastest way to capture a task from natural language. Parses hashtags (#tag), project (+project), group (@group), and due dates (due:...) automatically. Use instead of create_item for simple quick-adds. Do NOT use for memories—use capture_context instead.",
     {
+      description: "Fastest way to capture a task from natural language. Parses hashtags (#tag), project (+project), group (@group), and due dates (due:...) automatically. Use instead of create_item for simple quick-adds. Do NOT use for memories—use capture_context instead.",
+      inputSchema: {
       input: z.string().min(1),
       item_kind: itemKindSchema.optional(),
       due: z.string().optional(),
       priority: prioritySchema.optional(),
       startup_priority: z.number().int().min(1).max(10).optional().describe("Startup priority: 10 always load, 7 load if relevant, 3 historical/background, 1 ignore unless requested"),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const settings = await getAppSettings(env.APP_KV);
@@ -452,12 +471,14 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to capture item: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "capture_context",
-    "Capture a memory or context note. Use only when no suitable existing memory exists—prefer update_item for existing items. Use before capture to check for duplicates with find_semantic_conflicts. Use capture_context instead of quick_capture for non-actionable knowledge.",
     {
+      description: "Capture a memory or context note. Use only when no suitable existing memory exists—prefer update_item for existing items. Use before capture to check for duplicates with find_semantic_conflicts. Use capture_context instead of quick_capture for non-actionable knowledge.",
+      inputSchema: {
       input: z.string().min(1),
       tags: z.array(z.string()).optional(),
       project_slug: z.string().optional(),
@@ -465,7 +486,9 @@ export function registerTools(server: McpServer, env: Env) {
       pinned: z.boolean().optional(),
       startup_priority: z.number().int().min(1).max(10).optional().describe("Startup priority: 10 always load, 7 load if relevant, 3 historical/background, 1 ignore unless requested"),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const parsed = parseQuickInput(args.input, "memory");
@@ -492,23 +515,29 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to capture context: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "get_item",
-    "Fetch a single item by its numeric id. Use when you already know the item id (e.g. from a previous tool result). Do NOT use for discovery—use list_items, semantic_search, or context loading tools instead.",
-    { id: z.number().int().positive() },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    {
+      description: "Fetch a single item by its numeric id. Use when you already know the item id (e.g. from a previous tool result). Do NOT use for discovery—use list_items, semantic_search, or context loading tools instead.",
+      inputSchema: { id: z.number().int().positive() },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       const task = await loadTask(env, args.id);
       return task ? ok({ item: serializeTask(task) }) : err(`Item '${args.id}' not found`);
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "list_items",
-    "List and filter items by kind, status, project, group, tags, due date, priority, or text search. Use for targeted queries when semantic_search is too broad. Prefer context loading tools (get_startup_context, get_context_summary, get_focus_context) for general context gathering.",
     {
+      description: "List and filter items by kind, status, project, group, tags, due date, priority, or text search. Use for targeted queries when semantic_search is too broad. Prefer context loading tools (get_startup_context, get_context_summary, get_focus_context) for general context gathering.",
+      inputSchema: {
       ids: z.array(z.number().int().positive()).optional(),
       kinds: z.array(itemKindSchema).optional(),
       entity_types: z.array(entityTypeSchema).optional(),
@@ -530,7 +559,9 @@ export function registerTools(server: McpServer, env: Env) {
       offset: z.number().int().min(0).optional(),
       sort: sortSchema.optional(),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const tasks = await db.listItems(env.DB, {
@@ -561,14 +592,16 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to list items: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
   const contextLevelSchema = z.enum(["startup", "topic_summary", "project", "raw_memories"]);
 
-  server.tool(
+  server.registerTool(
     "load_context",
-    "Load context at a specific hierarchy level. Always follow this retrieval order: startup → topic_summary → project → raw_memories. Use startup for general conversations, topic_summary for topic-specific questions (e.g. 'my AWS setup'), project for project-specific work. Use raw_memories ONLY as a last resort when higher-level summaries cannot answer the request. Prefer get_startup_context, get_context_summary, and get_focus_context for most use cases.",
     {
+      description: "Load context at a specific hierarchy level. Always follow this retrieval order: startup → topic_summary → project → raw_memories. Use startup for general conversations, topic_summary for topic-specific questions (e.g. 'my AWS setup'), project for project-specific work. Use raw_memories ONLY as a last resort when higher-level summaries cannot answer the request. Prefer get_startup_context, get_context_summary, and get_focus_context for most use cases.",
+      inputSchema: {
       level: contextLevelSchema.optional().default("raw_memories").describe("Hierarchy level to load"),
       topic: z.string().optional().describe("Topic/group slug for level=topic_summary"),
       project_slug: z.string().optional().describe("Project slug for level=project"),
@@ -586,7 +619,9 @@ export function registerTools(server: McpServer, env: Env) {
       limit: z.number().int().min(1).max(100).optional(),
       use_cache: z.boolean().optional().default(true).describe("Read/write KV cache for startup/topic/project levels"),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const level = args.level ?? "raw_memories";
@@ -673,12 +708,14 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to load context: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "update_item",
-    "Update any field on an existing item (title, description, priority, due date, project, group, tags, lifecycle state, recurrence, etc.). Preferred over creating a new item whenever existing information changes. Always prefer updating over creating duplicates.",
     {
+      description: "Update any field on an existing item (title, description, priority, due date, project, group, tags, lifecycle state, recurrence, etc.). Preferred over creating a new item whenever existing information changes. Always prefer updating over creating duplicates.",
+      inputSchema: {
       id: z.number().int().positive(),
       title: z.string().optional(),
       description: z.string().nullable().optional(),
@@ -706,7 +743,9 @@ export function registerTools(server: McpServer, env: Env) {
       recurrence_until: z.string().nullable().optional(),
       clear_recurrence: z.boolean().optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const parsedDue = args.clear_due ? { due_at: null, normalized: null } : parseDueDate(args.due);
@@ -746,16 +785,20 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to update item: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "set_item_startup_priority",
-    "Set how important an item is for startup context loading. Scale: 10 = always load (critical), 8 = frequently needed, 5 = topic-specific (loads when relevant topic is active), 2 = historical/background (rarely needed), 0 = never auto-load. Use to control what appears in get_startup_context without loading raw memories.",
     {
+      description: "Set how important an item is for startup context loading. Scale: 10 = always load (critical), 8 = frequently needed, 5 = topic-specific (loads when relevant topic is active), 2 = historical/background (rarely needed), 0 = never auto-load. Use to control what appears in get_startup_context without loading raw memories.",
+      inputSchema: {
       id: z.number().int().positive(),
       startup_priority: z.number().int().min(0).max(10),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const task = await db.updateTask(env.DB, args.id, {
@@ -769,16 +812,20 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to set startup priority: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "set_item_pinned",
-    "Pin or unpin an item so it appears in focused context loads",
     {
+      description: "Pin or unpin an item so it appears in focused context loads. Use when you want an item to always be visible in get_focus_context or get_startup_context.",
+      inputSchema: {
       id: z.number().int().positive(),
       pinned: z.boolean(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const task = await db.updateTask(env.DB, args.id, { pinned: args.pinned });
@@ -790,16 +837,20 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to set pinned: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "set_item_lifecycle_state",
-    "Transition an item to active, superseded, archived, completed, stale, or dormant",
     {
+      description: "Transition an item to active, superseded, archived, completed, stale, or dormant. Use superseded instead of delete when replacing information. Use stale to deprioritize without deleting.",
+      inputSchema: {
       id: z.number().int().positive(),
       lifecycle_state: lifecycleStateSchema,
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const task = await db.updateTask(env.DB, args.id, {
@@ -814,18 +865,22 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to set lifecycle state: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "set_item_group",
-    "Assign or remove an item from a context group (topic/profile bucket)",
     {
+      description: "Assign or remove an item from a context group (topic/profile bucket). Use to organize items into retrievable topics like 'aws', 'career', 'health'.",
+      inputSchema: {
       id: z.number().int().positive(),
       group_slug: z.string().optional(),
       group_name: z.string().optional(),
       clear_group: z.boolean().optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const task = await db.updateTask(env.DB, args.id, {
@@ -844,18 +899,22 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to set group: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "set_item_project",
-    "Assign or remove an item from a project",
     {
+      description: "Assign or remove an item from a project. Use to organize project-specific work items under a named project.",
+      inputSchema: {
       id: z.number().int().positive(),
       project_slug: z.string().optional(),
       project_name: z.string().optional(),
       clear_project: z.boolean().optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const task = await db.updateTask(env.DB, args.id, {
@@ -874,13 +933,17 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to set project: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "delete_item",
-    "Delete a single item by id",
-    { id: z.number().int().positive() },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    {
+      description: "Permanently delete a single item. Prefer superseding or archiving over deletion to preserve history.",
+      inputSchema: { id: z.number().int().positive() },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+  
     async (args) => {
       try {
         const deleted = await db.deleteTask(env.DB, args.id);
@@ -897,15 +960,19 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to delete item: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "delete_items",
-    "Delete multiple items by id",
     {
+      description: "Permanently delete multiple items by id. Prefer superseding or archiving over deletion to preserve history.",
+      inputSchema: {
       ids: z.array(z.number().int().positive()).min(1),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+  
     async (args) => {
       try {
         const deleted = await db.deleteTasks(env.DB, args.ids);
@@ -923,15 +990,19 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to delete items: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "get_focus_task",
-    "Return the active tactical next step from the current objective, kept for compatibility",
     {
+      description: "Return the single active tactical next step from the current objective. Prefer get_focus_context for full planning context including blockers and recurring systems.",
+      inputSchema: {
       project_slug: z.string().optional(),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const cached = args.project_slug ? null : await getCachedFocusTask(env);
@@ -957,15 +1028,19 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to select focus task: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "get_focus_context",
-    "Return layered focus: strategic objective, active tactical next step, blockers, recurring systems, and replaced items",
     {
+      description: "Preferred for planning, prioritization, recommendations, next steps, roadmaps, and project guidance. Returns strategic objective, tactical next step, blockers, recurring systems, and replaced items. Use before loading project context for most planning tasks.",
+      inputSchema: {
       project_slug: z.string().optional(),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const context = await db.getFocusContext(env.DB, args.project_slug?.toLowerCase());
@@ -974,18 +1049,22 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to get focus context: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "set_active_objective",
-    "Set the one canonical active strategic objective for a project, creating it when title is supplied",
     {
+      description: "Set the single canonical active strategic objective for a project. Use to define what 'done' looks like for a project. Creates a new objective if title is supplied, or links an existing item.",
+      inputSchema: {
       project_slug: z.string().min(1),
       item_id: z.number().int().positive().optional(),
       title: z.string().min(1).optional(),
       description: z.string().optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const result = await db.setActiveObjective(env.DB, {
@@ -1006,17 +1085,21 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to set active objective: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "supersede_items",
-    "Mark old items as superseded by a newer item and add supersedes relationships",
     {
+      description: "Mark old items as superseded by a newer item and add supersedes relationships. Use when newer information replaces older information instead of creating another active memory.",
+      inputSchema: {
       source_item_id: z.number().int().positive(),
       target_item_ids: z.array(z.number().int().positive()).min(1),
       reason: z.string().optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const result = await db.supersedeItems(env.DB, args.source_item_id, args.target_item_ids, args.reason);
@@ -1038,15 +1121,19 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to supersede items: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "get_stale_tasks",
-    "Return stale active tasks that have not been updated recently",
     {
+      description: "Return stale active tasks that have not been updated recently. Use to review neglected tasks and decide whether to complete, snooze, or archive them.",
+      inputSchema: {
       limit: z.number().int().min(1).max(100).optional(),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const tasks = await db.getStaleTasks(env.DB, args.limit ?? 25);
@@ -1056,15 +1143,19 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to get stale tasks: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "mark_stale_candidates",
-    "Mark untouched active tactical tasks as stale so they stop competing for focus",
     {
+      description: "Mark untouched active tactical tasks as stale so they stop competing for focus. Use periodically to clean up stale tasks that are no longer relevant.",
+      inputSchema: {
       limit: z.number().int().min(1).max(100).optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const items = await db.markStaleCandidates(env.DB, args.limit ?? 25);
@@ -1078,16 +1169,20 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to mark stale candidates: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "update_task_state",
-    "Idempotently complete, snooze, or ignore a task item",
     {
+      description: "Idempotently complete, snooze, or ignore a task item. Use complete to mark done, snooze to temporarily hide, or ignore to deprioritize. Safe to call multiple times.",
+      inputSchema: {
       id: z.number().int().positive(),
       action: z.enum(["complete", "snooze", "ignore"]),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const settings = await getAppSettings(env.APP_KV);
@@ -1108,12 +1203,14 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to update task state: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "semantic_search",
-    "Search semantically across tasks and memories and hydrate matching items from D1",
     {
+      description: "Preferred when specific historical context is needed but the location is unknown. Use before loading raw memories. Returns semantically similar items with relevance scores.",
+      inputSchema: {
       query: z.string().min(1),
       kinds: z.array(itemKindSchema).optional(),
       entity_types: z.array(entityTypeSchema).optional(),
@@ -1121,7 +1218,9 @@ export function registerTools(server: McpServer, env: Env) {
       include_obsolete: z.boolean().optional(),
       limit: z.number().int().min(1).max(50).optional(),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const defaultStates = args.include_obsolete
@@ -1161,19 +1260,23 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to semantic-search items: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "find_semantic_conflicts",
-    "Find active items semantically similar to a query or item and return likely duplicate/supersession candidates",
     {
+      description: "Always use before creating new memories to detect duplicates or existing context that should be updated. Returns likely duplicate/supersession candidates with suggested actions.",
+      inputSchema: {
       query: z.string().optional(),
       item_id: z.number().int().positive().optional(),
       project_slug: z.string().optional(),
       threshold: z.number().min(0).max(1).default(0.78),
       limit: z.number().int().min(1).max(50).optional(),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         let query = args.query;
@@ -1205,18 +1308,22 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to find semantic conflicts: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "find_consolidation_candidates",
-    "Deterministically find groups of context items (especially memories) that share tags and may be duplicates, supersessions, or replacements",
     {
+      description: "Use periodically or before cleanup to identify duplicate or overlapping memories that share tags. Returns groups of candidates for consolidation.",
+      inputSchema: {
       item_kind: z.enum(["memory", "task"]).optional().default("memory"),
       tag: z.string().optional(),
       min_group_size: z.number().int().min(2).optional(),
       limit: z.number().int().min(1).max(50).optional(),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const candidates = await db.findConsolidationCandidates(env.DB, {
@@ -1230,19 +1337,23 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to find consolidation candidates: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "consolidate_memories",
-    "Link a keeper item to related items with a relationship and optionally mark the targets as superseded",
     {
+      description: "Use after duplicate detection to merge or supersede overlapping memories. Links a keeper item to related items with a relationship and optionally marks the targets as superseded.",
+      inputSchema: {
       source_item_id: z.number().int().positive(),
       target_item_ids: z.array(z.number().int().positive()).min(1),
       relationship_type: z.enum(["duplicate_of", "supersedes", "replaces", "derived_from"]),
       reason: z.string().optional(),
       mark_superseded: z.boolean().optional().default(true),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+  
     async (args) => {
       try {
         const result = await db.consolidateItems(
@@ -1268,16 +1379,20 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to consolidate memories: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "get_project_timeline",
-    "Return objective/focus/history events for a project",
     {
+      description: "Return objective/focus/history timeline events for a project. Use to review project evolution and decision history.",
+      inputSchema: {
       project_slug: z.string().min(1),
       limit: z.number().int().min(1).max(100).optional(),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         return ok({
@@ -1288,79 +1403,103 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to get project timeline: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "list_projects",
-    "List all projects",
-    {},
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    {
+      description: "List all projects. Use to discover available projects before assigning items or loading project context.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async () => ok({ projects: await db.listProjects(env.DB) })
+  
   );
 
-  server.tool(
+  server.registerTool(
     "upsert_project",
-    "Create or ensure a project exists",
     {
+      description: "Create or ensure a project exists. Use before assigning items to a new project.",
+      inputSchema: {
       name: z.string().min(1),
       slug: z.string().optional(),
       description: z.string().optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       const project = await db.upsertProject(env.DB, args);
       await invalidateContextCache(env.APP_KV);
       return ok({ project });
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "delete_project",
-    "Delete a project by slug",
-    { slug: z.string().min(1) },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    {
+      description: "Delete a project by slug. Items in the project will not be deleted.",
+      inputSchema: { slug: z.string().min(1) },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+  
     async (args) => {
       const deleted = await db.deleteProject(env.DB, args.slug.toLowerCase());
       await invalidateContextCache(env.APP_KV);
       return ok({ deleted });
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "list_groups",
-    "List all groups",
-    {},
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    {
+      description: "List all groups. Use to discover available topic groups before assigning items or loading topic context.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async () => ok({ groups: await db.listGroups(env.DB) })
+  
   );
 
-  server.tool(
+  server.registerTool(
     "upsert_group",
-    "Create or ensure a group exists",
     {
+      description: "Create or ensure a group exists. Use before assigning items to a new topic group.",
+      inputSchema: {
       name: z.string().min(1),
       slug: z.string().optional(),
       description: z.string().optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       const group = await db.upsertGroup(env.DB, args);
       await invalidateContextCache(env.APP_KV);
       return ok({ group });
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "update_group_metadata",
-    "Update a context group's deterministic retrieval metadata: kind, priority, description, and summary mode",
     {
+      description: "Update a context group's deterministic retrieval metadata: kind (topic/profile/project/system), priority, description, and summary mode. Use to control how groups are retrieved and summarized.",
+      inputSchema: {
       slug: z.string().min(1),
       group_kind: z.enum(["topic", "profile", "project", "system"]).optional(),
       retrieval_priority: z.number().int().min(0).max(100).optional(),
       description: z.string().optional(),
       summary_mode: z.enum(["auto", "manual"]).optional(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const group = await db.updateGroupMetadata(env.DB, args.slug.toLowerCase(), {
@@ -1376,16 +1515,20 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to update group metadata: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "set_group_canonical_item",
-    "Set the canonical active item that represents the current state of a topic/group. Pass null to clear.",
     {
+      description: "Set the single canonical memory that represents the current state of a topic/group so future retrieval uses summaries instead of many memories. Pass null to clear.",
+      inputSchema: {
       group_slug: z.string().min(1),
       item_id: z.number().int().positive().nullable(),
     },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const group = await db.setGroupCanonicalItem(env.DB, args.group_slug.toLowerCase(), args.item_id);
@@ -1395,38 +1538,50 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to set group canonical item: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "delete_group",
-    "Delete a group by slug",
-    { slug: z.string().min(1) },
-    { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    {
+      description: "Delete a group by slug. Items in the group will not be deleted.",
+      inputSchema: { slug: z.string().min(1) },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true },
+    },
+  
     async (args) => {
       const deleted = await db.deleteGroup(env.DB, args.slug.toLowerCase());
       await invalidateContextCache(env.APP_KV);
       return ok({ deleted });
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "list_tags",
-    "List all tags",
-    {},
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    {
+      description: "List all tags. Use to discover available tags before assigning items or filtering.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async () => ok({ tags: await db.listTags(env.DB) })
+  
   );
 
-  server.tool(
+  server.registerTool(
     "get_context_summary",
-    "Return the canonical current state and deterministic summary for a topic (group or tag slug).",
     {
+      description: "Preferred for topic-specific conversations (AWS, career, IITM, health, etc.). Use instead of loading raw memories whenever a summarized state is sufficient. Returns canonical current state and deterministic summary for a topic.",
+      inputSchema: {
       scope: z.string().min(1).optional().describe("Topic or project slug (e.g. work, health, my-project)"),
       topic: z.string().optional().describe("Alias for scope; lowercased tag/topic slug"),
       project_slug: z.string().optional().describe("Project slug; if provided, summary is project-scoped"),
       use_cache: z.boolean().optional().default(true).describe("Whether to read/write KV cache"),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const effectiveScope = (args.scope ?? args.topic ?? args.project_slug ?? "").toLowerCase();
@@ -1452,15 +1607,19 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to get context summary: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 
-  server.tool(
+  server.registerTool(
     "get_startup_context",
-    "Return an extremely lightweight startup context: profile, active goals, current focus, active projects, always-load items, and topic summaries.",
     {
+      description: "Preferred first call for conversations requiring user context. Returns the minimal startup context needed for most requests: profile, active goals, current focus, active projects, always-load items, and topic summaries. Use before loading topic or project context.",
+      inputSchema: {
       use_cache: z.boolean().optional().default(true),
     },
-    { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
+    },
+  
     async (args) => {
       try {
         const useCache = args.use_cache ?? true;
@@ -1481,6 +1640,7 @@ export function registerTools(server: McpServer, env: Env) {
         return err(`Failed to get startup context: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  
   );
 }
 
